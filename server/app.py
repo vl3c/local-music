@@ -6,7 +6,7 @@ Audiobox Aesthetics) and does all analysis and mastering, so every take is judge
 
     start.cmd   (the server runs only in the console window start.cmd opens)
 
-A request makes N takes (best-of-N, default 3) on consecutive seeds, checks and scores each,
+A request makes N takes (best-of-N, default 4) on consecutive seeds, checks and scores each,
 rejects the broken ones and returns them all ranked. Its files live in output/<id>/:
 
     request.json         the request, the prompt actually sent, and every take's scores
@@ -251,7 +251,7 @@ def _release_cache() -> None:
 # (gitignored) and override them for the page and for every request that leaves a key out.
 REPO_DEFAULTS = {
     "engine": "medium",
-    "n": 3,                   # best-of-N
+    "n": 4,                   # best-of-N
     "seed": None,             # None: a random start seed; takes use seed, seed+1, ...
     "steps": None,            # None: the engine's default (8)
     "duration": 30.0,         # seconds

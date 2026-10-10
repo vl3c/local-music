@@ -5,7 +5,7 @@ description: Generate instrumental music locally with Stable Audio 3 Medium on t
 
 # local-music: instrumental music on the local GPU
 
-You describe the music; the server makes N takes (default 3), checks, scores and ranks them,
+You describe the music; the server makes N takes (default 4), checks, scores and ranks them,
 masters them, and hands back WAV + MP3 files with a picture of each (waveform, loudness over
 time, spectrogram with the bar grid).
 
@@ -26,7 +26,7 @@ M=~/.claude/skills/local-music/scripts/music.py
 $PY $M "A warm lo-fi hip hop beat with dusty piano chords, soft vinyl crackle and a laid-back boom bap groove" --bpm 84 --duration 60 --wait 180 --out <dir>
 ```
 
-That makes 3 takes, prints them ranked with scores, tempo, key and PNG paths, and copies the
+That makes 4 takes, prints them ranked with scores, tempo, key and PNG paths, and copies the
 best to `<dir>` as `warm-lofi-hip-hop_v01.wav` + `.mp3` + a `.json` sidecar. Read the PNG of
 the top take. Send files with SendUserFile if you have it (the MP3 plays inline); otherwise
 give the paths.
@@ -121,7 +121,7 @@ response (plus `delivered`): parse that rather than the text.
 | `--duration S` | 2-380 s (default 30). Pick what the use needs: a menu loop 20-40 s, a level track 2-4 min. |
 | `--bpm N`, `--key K` | Added to the prompt and checked. Ask for a tempo whenever it matters (loops, editing to picture). |
 | `--stem` | One instrument or part ("a drum loop", "solo cello") instead of a full arrangement. |
-| `--n N` | Takes (default 3, max 8). Generation is cheap (seconds); checks take a few seconds per minute of music. |
+| `--n N` | Takes (default 4, max 8). Generation is cheap (seconds); checks take a few seconds per minute of music. |
 | `--seed N` / `--seeds A,B` | Reproduce takes. |
 | `--length S`, `--fade-in S`, `--fade-out S` | Cut, fades. `--fade-out` unset = automatic (3 s, only if the take stops at full level); `0` keeps a hard cut. |
 | `--lufs X`, `--peak X` | Loudness (default -14 LUFS: music on its own; -16 to -20 under dialogue or as a background bed) and true-peak ceiling (default -1 dBTP). |

@@ -46,7 +46,7 @@ python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
    (`TrackType: Music, VocalType: Instrumental`, or `TrackType: Instrument` for a single
    instrument with `--stem`), plus the tempo ("84 BPM") and key ("in A minor") if you give
    them. `--raw` sends the text as written; `--show-prompt` shows what would be sent.
-2. **The takes.** The engine makes N takes (default 3) on consecutive seeds, at 44.1 kHz stereo.
+2. **The takes.** The engine makes N takes (default 4) on consecutive seeds, at 44.1 kHz stereo.
    Its output is kept in full float (the library clamps to full scale, so the worker gives
    the decoder 12 dB of headroom first and takes it back after; no peaks are clipped).
 3. **The checks**, on every take, for a caller that can't listen:
@@ -173,7 +173,7 @@ python scripts\music.py --settings
 | `--duration S` | 2-380 s on Medium, 2-120 on Small (default 30). |
 | `--bpm N` / `--key K` | Added to the prompt and checked in the result. Keys: `A minor`, `F# major`, `Bbm`... The model follows the key on clearly tonal music (a solo piano in E minor came out in E minor 3 times out of 3); busy or jazzy harmony reads as "unclear". |
 | `--stem` | One instrument or part instead of a full arrangement. |
-| `--n N` | Takes to make and rank (default 3, max 8). |
+| `--n N` | Takes to make and rank (default 4, max 8). |
 | `--seed N` / `--seeds A,B` | Start seed (takes use N, N+1...) or exact seeds; `random` by default. |
 | `--engine medium\|small` | Medium (default) or Small-Music (installed with `-WithSmall`). |
 | `--raw` | Send the text as written: no tags, tempo or key added. |

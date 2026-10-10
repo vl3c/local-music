@@ -2,7 +2,7 @@
 
 The server must be running (start.cmd). Everything stays on 127.0.0.1.
 
-    python scripts/music.py "warm lo-fi hip hop, dusty piano, vinyl crackle" --bpm 84    # 3 takes, ranked
+    python scripts/music.py "warm lo-fi hip hop, dusty piano, vinyl crackle" --bpm 84    # 4 takes, ranked
     python scripts/music.py "epic orchestral trailer music" --duration 120 --out D:/game/music
     python scripts/music.py "chiptune boss battle" --bpm 160 --loop-bars 8 --out D:/game/music
     python scripts/music.py "solo nylon guitar, flamenco" --stem --key "E minor"
@@ -235,7 +235,7 @@ def main() -> int:
     g.add_argument("--key", help="key, e.g. 'A minor', 'F# major', 'Bbm': added to the prompt and checked")
     g.add_argument("--stem", action="store_true", help="one instrument or part (a drum loop, a solo piano), "
                    "not a full arrangement")
-    g.add_argument("--n", type=int, help="takes to make and rank (best-of-N; default 3)")
+    g.add_argument("--n", type=int, help="takes to make and rank (best-of-N; default 4)")
     g.add_argument("--seed", help="start seed (takes use seed, seed+1, ...), or 'random' (the default)")
     g.add_argument("--seeds", help="exact seeds, comma-separated (e.g. to remake one take: --seeds 1234)")
     g.add_argument("--engine", choices=["medium", "small"], help="medium (Stable Audio 3 Medium, the default) or "
