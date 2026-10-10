@@ -353,7 +353,7 @@ def print_request(res: dict) -> None:
         if ly.get("start") or ly.get("end") is not None:
             bits.append(f"@{ly.get('start', 0):g}-{ly['end']:g}")
         bits.append(f"vol {ly['gain_db']:+g} dB")
-        if "lufs" in ly:
+        if ly.get("lufs") is not None:
             bits.append(f"plays at {ly['lufs']:g} LUFS")
         if ly.get("at"):
             bits.append(f"from {ly['at']:g} s")

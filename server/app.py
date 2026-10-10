@@ -1205,9 +1205,10 @@ def mix(req: MixReq):
             part = post.add_reverb(part, sr, item.reverb)
         layers.append(post.Layer(audio=part, gain_db=item.gain_db, offset_s=item.at))
         srcs.append(src)
+        loud = analysis.lufs(part, sr)
         d = {"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
-             "start": round(a, 2), "end": round(b, 2),
-             "lufs": round(analysis.lufs(part, sr) + item.gain_db, 1)}  # as it plays in the mix, before mastering
+             "start": round(a, 2), "end": round(b, 2),  # as it plays in the mix, before mastering (None: silent)
+             "lufs": round(loud + item.gain_db, 1) if loud > -70 else None}
         if item.spans:
             d["spans"] = [sp.model_dump() for sp in item.spans]
         if item.reverb != "none":
