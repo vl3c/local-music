@@ -109,8 +109,11 @@ generated one, nothing generated. Everything above works from its ref: extend it
 piece, vary it (timbre or style transfer: a melody played on another instrument at strength
 ~0.4-0.6), inpaint a span, loop it, master it, or put it in a song. The description becomes the
 prompt that later work continues from; without one, the engine is led by the audio alone (and
-CLAP has nothing to score). `--extend`, `--vary` and `--inpaint` take a file path directly too
-(imported first). Up to 20 minutes and 300 MB; other formats (M4A, AAC) need converting first.
+CLAP has nothing to score). `--extend`, `--vary`, `--inpaint` and `--mix` take a file path directly
+too (imported first). Silence at the file's start and end is trimmed like a generated take's;
+`--keep-silence` (API `trim=false`) keeps it, so the take keeps the file's own timeline (a voice
+whose word timings come from elsewhere; files given to `--mix` always keep it). Up to 20 minutes
+and 300 MB; other formats (M4A, AAC) need converting first.
 What you may do with someone else's recording is up to its licence: the tool doesn't check.
 
 Measured: Windows' `Alarm01.wav` (5.6 s) extended by 40 s as "an upbeat tropical house track
@@ -119,15 +122,32 @@ built around a bright marimba melody" came back as music (CE 7.4, PQ 8.4); varie
 
 ### Mixing takes on top of each other
 
-`--mix SONG:1,vol=-8 VOICE:0,at=4` (or **Mix on top** in the page's Song tray) layers takes: each
-is the take's delivered track (what you hear: mastered, or its loop), at its own volume
-(`vol=`, dB, default 0) starting at its own time (`at=`, seconds, default 0), optionally a span
-(`REF@10-40`). The mix runs as long as its longest layer. Nothing levels or ducks the layers:
-the balance is yours. The sum is mastered like any take (so the overall loudness is the usual
--14 LUFS and the volumes set the balance between layers), and it's a take itself: extend it,
-loop it, re-master it, or mix it again. A voice is usually imported first (`--import
-voice.mp3`); at 0 dB both layers sit at the same loudness, so a voice over a busy song
-typically wants the song at -6 to -12.
+`--mix SONG:1,vol=-8 voice.wav,at=4,voice` (or **Mix on top** in the page's Song tray) layers
+takes: each is the take's delivered track (what you hear: its fades, cut or loop, at its
+loudness), at its own volume (`vol=`, dB, default 0) starting at its own time (`at=`, seconds,
+default 0), optionally a span (`REF@10-40`). A layer can be an audio file: it's imported first,
+silence and all, so `at` and the spans below line up with the file's own timeline. The mix runs
+as long as its longest layer, and keeps its silence: a layer at `at=4` starts 4 s into the
+delivered mix. Nothing levels or ducks the layers: the balance is yours. The
+sum is mastered like any take (so the overall loudness is the usual -14 LUFS and the volumes
+set the balance between layers), and it's a take itself: extend it, loop it, re-master it, or
+mix it again.
+
+- **vol=0 means "as loud as it's delivered"**: each layer's loudness in the mix is printed
+  (`plays at -17 LUFS`). A song delivered at -17 LUFS and a voice imported at -14 sit 3 dB
+  apart at vol=0; a voice over a busy song typically wants the song another -6 to -12.
+- **Layers are mixed before their own limiter**: the mix is limited once, as a whole, so a
+  voice's loud moments (a shouted or sung last word) come through as they were.
+- **Edits per layer**: `boost=START-END:DB` raises or lowers it there (seconds on the take's
+  timeline as it plays, like `@START-END`, not the mix's; for a file, the file's own timeline;
+  repeatable; 30 ms ramps), e.g. `boost=60.9-63.5:+4` for a held last word;
+  `reverb=room|hall|cathedral` puts a dry layer in a space (a light room: `room`), keeping its
+  loudness, so its `vol` means the same.
+- **`voice` marks speech**: the mix measures, while it speaks, how far the voice sits above
+  everything else in the speech band (300-3400 Hz), and warns where it falls under the rest
+  for a second or more, or when its quieter tenth is less than 6 dB above it: words there may
+  be lost (calibrated against Whisper on real mixes). The numbers are in the layer's
+  `speech_margin`. A proxy: listening, or transcribing the mix, is the real test.
 
 ### Joining takes into one song
 
@@ -137,7 +157,8 @@ seconds of new music between them (default 2 bars at the first part's tempo, 4 s
 0 blends the parts straight into each other) and rewrites `--blend` seconds (default 1) of each
 part beside it so they flow into it. Everything else is the parts' own audio, sample for
 sample, each brought to its delivered loudness first (an imported recording joins as loud as it
-plays on its own). The text describes the bridges
+plays on its own; `,vol=DB` sets a part quieter or louder than that: `REF,vol=-6` for a quiet
+intro before a loud main part). The text describes the bridges
 ("a big drum fill and a rising synth sweep"; default: the first part's prompt).
 
 - A part can be a span of a take: `REF@20-60` (seconds as the take plays, as on its picture;
@@ -252,13 +273,15 @@ python scripts\music.py --settings
 | `--lufs X` / `--peak X` | Loudness target (default -14; -16 to -18 sits under dialogue) and true-peak ceiling (default -1 dBTP). |
 | `--loop-bars N` / `--beats-per-bar N` | Deliver a seamless loop of N bars (give `--bpm` when generating so the take is long enough); 4 beats per bar by default. |
 | `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take, or an audio file (above). |
-| `--import FILE` | Your own audio as a take; the text describes it. |
-| `--combine PART PART...`, `--bridge S`, `--blend S` | Join takes into one song; parts are `REF` or `REF@START-END`. Put the text before `--combine`. |
-| `--mix LAYER LAYER...` | Takes on top of each other: `REF[@START-END][,vol=DB][,at=SECONDS]`. |
+| `--import FILE`, `--keep-silence` | Your own audio as a take; the text describes it. `--keep-silence` keeps the file's timeline. |
+| `--combine PART PART...`, `--bridge S`, `--blend S` | Join takes into one song; parts are `REF` or `REF@START-END`, optionally `,vol=DB`. Put the text before `--combine`. |
+| `--mix LAYER LAYER...` | Takes or audio files on top of each other: `REF[@START-END]` or a file, then `,vol=DB`, `,at=SECONDS`, `,boost=START-END:DB`, `,reverb=room\|hall\|cathedral`, `,voice`. |
 | `--master REQ` | Re-master a request with the mastering flags; `--no-loop`, `--full-length` undo a loop or a cut. |
-| `--out DIR` | Copy the best take (`--best N`, `--all`) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
+| `--out DIR` | Copy the best take (`--best N`, `--all`, or `--pick SEEDS` for those very takes) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
+| `--show REQ:SEED --out DIR` | Deliver one take of an earlier request, whatever its rank. |
+| `--export REQ:SEED --out DIR` | The take and every request it was made from (sources, parts, layers, all the way back), copied to DIR with a manifest: copy its `requests/` folders back into `output/` and every ref works again. Do this before cleaning up `output/`. |
 | `--play`, `--no-save`, `--json`, `--wait S` | Play the best take; delete the request afterwards; print the server's JSON; wait for the server. |
-| `--show-prompt`, `--list`, `--show REQ`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up (`--show`: an earlier request's takes and files). |
+| `--show-prompt`, `--list`, `--show REQ`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up (`--show`: an earlier request's takes and files). `--delete` refuses a request another one was made from (a mix of it, an extension...); `--force` deletes it anyway. |
 | `--save-defaults` / `--reset-defaults` | Save the options given with it (`--n`, `--duration`, `--lufs`, `--fade-out`...) as your defaults, merged with what's saved; or forget them. The page's **Save as my defaults** does the same. |
 
 A take's **ref** is `<request id>:<seed>`. Exit codes: 0 done, 1 no server or failed, 2 bad
@@ -281,11 +304,11 @@ full output goes to `logs\server.log`, timestamped. Each start keeps the previou
 | `POST /api/extend` | `{"take", "seconds"?, "text"?, + shape and mastering}` | the same, for the longer track |
 | `POST /api/vary` | `{"take", "strength"?, "text"?, ...}` | variations |
 | `POST /api/inpaint` | `{"take", "start", "end", "text"?, ...}` | the take with that span redone |
-| `POST /api/import?filename=&text=&kind=&name=&check=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
-| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?}, ...], "name"?, "check"?, + mastering}` | the mix, as one take (seed 0) |
-| `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
+| `POST /api/import?filename=&text=&kind=&name=&check=&trim=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
+| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?, "spans"?: [{"start", "end", "gain_db"}], "reverb"?, "voice"?}, ...], "name"?, "check"?, + mastering}` | the mix, as one take (seed 0); each layer with its `lufs` in the mix and, for a voice, its `speech_margin` |
+| `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?, "gain_db"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
 | `POST /api/master` | `{"request", "length"?, "fade_in"?, "fade_out"?, "lufs"?, "peak_dbtp"?, "loop_bars"?, "beats_per_bar"?, "bpm"?}` | the request, re-mastered (`null` clears `length` / `loop_bars`) |
-| `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>` | | list, one, delete |
+| `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>?force=` | | list, one, delete (409 while another request was made from it, unless `force=true`) |
 | `GET /api/prompt?text=&bpm=&key=&kind=&raw=` | | the prompt and file name a request would use |
 | `GET /api/engines`, `POST /api/engines/<name>/stop` | | installed / running; stop one to free its VRAM |
 | `GET` / `POST` / `DELETE /api/settings` | | effective, saved and built-in defaults |

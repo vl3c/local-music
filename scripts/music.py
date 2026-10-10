@@ -13,7 +13,9 @@ The server must be running (start.cmd). Everything stays on 127.0.0.1.
     python scripts/music.py --import D:/audio/demo.mp3 "a slow acoustic folk song"    # your own audio, as a take
     python scripts/music.py --vary D:/audio/demo.mp3 "the same melody as a string quartet" --strength 0.5
     python scripts/music.py --combine A:1 B:7@20-60 C:3 --bridge 8                  # one song, bridged
-    python scripts/music.py --mix SONG:1,vol=-8 VOICE:0,at=4                         # a voice over a song
+    python scripts/music.py --mix SONG:1,vol=-8 voice.wav,at=4,voice,reverb=room     # a voice over a song
+    python scripts/music.py --show 20261010-120000-ab12:1234 --out D:/game/music       # deliver that very take
+    python scripts/music.py --export 20261010-120000-ab12:0 --out D:/keep/song         # it and all it's made from
     python scripts/music.py --show-prompt "dark synthwave" --bpm 100
     python scripts/music.py --show 20261010-120000-ab12                             # an earlier request's takes
     python scripts/music.py --save-defaults --n 6 --lufs -16                         # your defaults (page and API too)
@@ -45,8 +47,9 @@ SERVER = "http://127.0.0.1:8192"
 # says otherwise, which would hand the prompts to whatever the proxy is.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 OUTPUT = Path(__file__).resolve().parent.parent / "output"
-NAME = re.compile(r"^[A-Za-z0-9-]+$")
+NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+REF = re.compile(r"^\s*(?P<rid>[0-9]{8}-[0-9]{6}-[0-9a-f]{4})[:#/](?P<seed>[0-9]+)\s*$")  # as the server reads one
 PART = re.compile(r"^(?P<ref>[0-9]{8}-[0-9]{6}-[0-9a-f]{4}:[0-9]+)(?:@(?P<a>\d+(?:\.\d+)?)?-(?P<b>\d+(?:\.\d+)?)?)?$")
 AUDIO_EXT = (".wav", ".flac", ".ogg", ".mp3")
 
@@ -74,13 +77,15 @@ def call(path: str, payload: dict | None = None, timeout: float = 3600, method: 
 
 
 def upload(path: Path, text: str | None = None, name: str | None = None, check: bool | None = None,
-           kind: str | None = None) -> dict:
-    """POST an audio file's bytes to /api/import: it comes back as a request with one take (seed 0)."""
+           kind: str | None = None, trim: bool = True) -> dict:
+    """POST an audio file's bytes to /api/import: it comes back as a request with one take (seed 0).
+    trim=False keeps silence at its start and end (the file's own timeline)."""
     if path.stat().st_size > 300 * 2**20:  # the server's limit: say so instead of a cut connection
         print(f"{path.name} is over 300 MB: the server takes up to 300 MB (and 20 minutes)", file=sys.stderr)
         sys.exit(2)
     q = urllib.parse.urlencode(given({"filename": path.name, "text": text, "name": name, "kind": kind,
-                                      "check": None if check is None else str(check).lower()}))
+                                      "check": None if check is None else str(check).lower(),
+                                      "trim": None if trim else "false"}))
     req = urllib.request.Request(f"{SERVER}/api/import?{q}", data=path.read_bytes(),
                                  headers={"Content-Type": "application/octet-stream"}, method="POST")
     try:
@@ -107,21 +112,62 @@ def parse_part(spec: str) -> dict:
                   "end": float(m["b"]) if m["b"] else None})
 
 
-def parse_layer(spec: str) -> dict:
-    """REF[@START-END][,vol=DB][,at=SECONDS]: a take (or a span of it) at a volume, starting at a time."""
+def _db(v: str) -> float:
+    return float(v.strip().lower().removesuffix("db"))
+
+
+def parse_combine_part(spec: str) -> dict:
+    """REF[@START-END][,vol=DB]: a part of a song, at its delivered loudness plus vol."""
     head, *opts = [x.strip() for x in spec.split(",")]
-    layer = parse_part(head)
+    part = parse_part(head)
+    for o in opts:
+        k, _, v = o.partition("=")
+        try:
+            if k not in ("vol", "gain"):
+                raise ValueError
+            part["gain_db"] = _db(v)
+        except ValueError:
+            raise ValueError(f"part option {o!r}: use vol=DB (e.g. vol=-6 for a quieter intro)") from None
+    return part
+
+
+LAYER_HELP = ("REF[@START-END] or an audio file, then any of ,vol=DB ,at=SECONDS ,reverb=room|hall|cathedral "
+              ",boost=START-END:DB (louder or quieter there: seconds on the take's timeline as it plays, like @START-END; "
+              "repeatable) "
+              ",voice (speech: checked for staying clear of the rest)")
+
+
+def parse_layer(spec: str) -> dict:
+    """A take (or a span of it) or an audio file, at a volume, starting at a time; see LAYER_HELP.
+    A file comes back as {"file": path, ...}: main() imports it first."""
+    head, *opts = [x.strip() for x in spec.split(",")]
+    if PART.fullmatch(head):
+        layer = parse_part(head)
+    elif is_audio_file(head):
+        layer = {"file": head}
+    else:
+        raise ValueError(f"a layer is REQ:SEED, REQ:SEED@START-END or an audio file (WAV, FLAC, OGG, MP3), not {head!r}")
     for o in opts:
         k, _, v = o.partition("=")
         try:
             if k in ("vol", "gain"):
-                layer["gain_db"] = float(v.lower().removesuffix("db"))
+                layer["gain_db"] = _db(v)
             elif k == "at":
                 layer["at"] = float(v.lower().removesuffix("s"))
+            elif k == "reverb" and v in ("none", "room", "hall", "cathedral"):
+                layer["reverb"] = v
+            elif k == "boost":
+                span, _, g = v.partition(":")
+                if not (mm := SPAN.fullmatch(span)):
+                    raise ValueError
+                layer.setdefault("spans", []).append({"start": float(mm.group(1)), "end": float(mm.group(2)),
+                                                      "gain_db": _db(g)})
+            elif k == "voice" and not v:
+                layer["voice"] = True
             else:
                 raise ValueError
         except ValueError:
-            raise ValueError(f"layer option {o!r}: use vol=DB (e.g. vol=-8) or at=SECONDS (e.g. at=4)") from None
+            raise ValueError(f"layer option {o!r}: a layer is {LAYER_HELP}") from None
     return layer
 
 
@@ -179,7 +225,7 @@ def deliver(res: dict, takes: list[dict], out: Path, fmt: str, png: bool, name: 
     and each file is created exclusively, so even a file appearing meanwhile isn't clobbered.
     """
     if name is not None and not NAME.fullmatch(name):
-        raise ValueError(f"--name takes letters, digits and hyphens only, not {name!r}")
+        raise ValueError(f"--name takes letters, digits, hyphens and underscores only, not {name!r}")
     out.mkdir(parents=True, exist_ok=True)
     base = name or res["name"]
     exts = {"all": ["wav", "mp3"], "wav": ["wav"], "mp3": ["mp3"]}[fmt]
@@ -209,6 +255,57 @@ def deliver(res: dict, takes: list[dict], out: Path, fmt: str, png: bool, name: 
             paths.append(out / f"{stem}.png")
         v += 1
     return paths
+
+
+def sources_of(view: dict) -> list[str]:
+    """The request ids a request was made from (as the API shows it): its source's, parts', layers'."""
+    refs = [view.get("source")] + [x.get("take") for k in ("parts", "layers") for x in view.get(k) or []]
+    return [m["rid"] for r in refs if isinstance(r, str) and (m := REF.fullmatch(r))]
+
+
+EXPORT_README = """This folder holds a take made with local-music and everything it was made from.
+
+  {files}   the take itself
+  requests/         every request in its chain: {chain}
+  local-music-export.json   what each request was (prompt, seeds, sources, mastering)
+
+To work from it again (re-master it, extend it, remix it), copy the folders in requests/ into
+local-music's output/ folder: every ref in the chain works as before, e.g. {ref}
+"""
+
+
+def export(ref: str, out: Path, fmt: str, png: bool, name: str | None) -> tuple[list[Path], list[str]]:
+    """A take and every request it was made from (sources, parts, layers, all the way back),
+    copied into `out`: the take as <name>_vNN.*, the requests' folders under requests/."""
+    m = REF.fullmatch(ref)
+    if not m:
+        raise ValueError(f"--export takes a take's ref (REQ:SEED), not {ref!r}")
+    rid, seed = m["rid"], m["seed"]
+    chain: dict[str, dict] = {}
+    todo = [rid]
+    while todo:
+        r = todo.pop()
+        if r not in chain:
+            chain[r] = call(f"/api/requests/{r}")
+            todo += sources_of(chain[r])
+    dst = out / "requests"
+    dst.mkdir(parents=True, exist_ok=True)
+    for r in chain:
+        if not (dst / r).exists():
+            shutil.copytree(OUTPUT / r, dst / r)
+    root = chain[rid]
+    takes = [t for t in root["takes"] if str(t["seed"]) == seed]
+    if not takes:
+        raise ValueError(f"request {rid} has no take with seed {seed}")
+    files = deliver(root, takes, out, fmt, png=png, name=name)
+    keep = ("id", "created", "op", "name", "text", "prompt", "bpm", "key", "engine", "model", "seeds", "source",
+            "span", "seconds", "strength", "parts", "bridge", "blend", "layers", "post")
+    manifest = {"take": takes[0]["ref"], "files": [f.name for f in files],
+                "requests": [{k: v[k] for k in keep if k in v} for v in chain.values()]}
+    (out / "local-music-export.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out / "README.txt").write_text(EXPORT_README.format(files=", ".join(f.name for f in files), chain=", ".join(chain),
+                                                         ref=takes[0]["ref"]), encoding="utf-8")
+    return files, list(chain)
 
 
 # --------------------------------------------------------------------------- printing
@@ -246,13 +343,28 @@ def describe(t: dict) -> str:
 
 def print_request(res: dict) -> None:
     what = res.get("op", "generate") + (f" of {res['source']}" if res.get("source") else "")
-    if res.get("layers"):
-        what += " of " + " + ".join(f"{ly['take']} {ly['gain_db']:+g} dB" + (f" at {ly['at']:g} s" if ly.get("at") else "")
-                                    for ly in res["layers"])
     if res.get("parts"):
-        what += " of " + " + ".join(pt["take"] + (f"@{pt['start']:g}-{pt['end']:g}" if pt.get("start") else "")
+        what += " of " + " + ".join(pt["take"] + (f"@{pt['start']:g}-{pt['end']:g}" if pt.get("end") is not None else "")
+                                    + (f" {pt['gain_db']:+g} dB" if pt.get("gain_db") else "")
                                     for pt in res["parts"]) + f" (bridges of {res.get('bridge', 0):g} s)"
     print(f"request {res['id']}  {what}  {res.get('engine')}  {res.get('name')}")
+    for ly in res.get("layers") or []:
+        bits = [f"layer {ly['take']}"]
+        if ly.get("start") or ly.get("end") is not None:
+            bits.append(f"@{ly.get('start', 0):g}-{ly['end']:g}")
+        bits.append(f"vol {ly['gain_db']:+g} dB")
+        if ly.get("lufs") is not None:
+            bits.append(f"plays at {ly['lufs']:g} LUFS")
+        if ly.get("at"):
+            bits.append(f"from {ly['at']:g} s")
+        if ly.get("reverb"):
+            bits.append(f"reverb {ly['reverb']}")
+        for sp in ly.get("spans", []):
+            bits.append(f"{sp['gain_db']:+g} dB at {sp['start']:g}-{sp['end']:g} s")
+        m = ly.get("speech_margin")
+        if m and m.get("median_db") is not None:
+            bits.append(f"voice: {m['median_db']:+g} dB over the rest in the speech band (quietest tenth {m['p10_db']:+g})")
+        print("  " + "  ".join(bits))
     if res.get("prompt"):
         print(f"prompt:   {res['prompt']}")
     if "negative" in res.get("ignored", []):
@@ -327,17 +439,21 @@ def main() -> int:
     s.add_argument("--inpaint", metavar="REF", help="regenerate a span of the take, keep the rest")
     s.add_argument("--span", help="with --inpaint: START-END in seconds, e.g. 20-28")
     s.add_argument("--import", dest="import_file", metavar="FILE", type=Path,
-                   help="your own audio (WAV, FLAC, OGG, MP3) as a take; the text describes it. --extend, --vary "
-                        "and --inpaint also take a file directly")
+                   help="your own audio (WAV, FLAC, OGG, MP3) as a take; the text describes it. --extend, --vary, "
+                        "--inpaint and --mix also take a file directly")
+    s.add_argument("--keep-silence", action="store_true", help="with --import: keep silence at the file's start and "
+                   "end, so the take keeps the file's timeline (a voice with word timings). Files given to --mix "
+                   "always keep it")
     s.add_argument("--combine", nargs="+", metavar="PART", help="takes in order as one song, with a bridge written "
-                   "between each two: REF or REF@START-END; the text describes the bridges")
+                   "between each two: REF or REF@START-END, then ,vol=DB for a part quieter or louder than its "
+                   "delivered level (a quiet intro: vol=-6); the text describes the bridges")
     s.add_argument("--bridge", type=float, help="with --combine: seconds of new music at each join (default 2 bars, "
                    "or 4 s without a tempo; 0 = blend the parts straight into each other)")
     s.add_argument("--blend", type=float, help="with --combine: seconds of each part regenerated beside a bridge "
                    "(default 1)")
-    s.add_argument("--mix", nargs="+", metavar="LAYER", help="takes on top of each other (a voice over a song): "
-                   "REF[@START-END][,vol=DB][,at=SECONDS]; each layer at its own volume (default 0 dB), "
-                   "starting at its time (default 0)")
+    s.add_argument("--mix", nargs="+", metavar="LAYER", help="takes on top of each other (a voice over a song). A "
+                   "layer is " + LAYER_HELP + ". vol=0 plays a layer at its delivered loudness (its LUFS is printed); "
+                   "it starts at `at` (default 0)")
     m = ap.add_argument_group("mastering (also with --master REQ)")
     m.add_argument("--length", type=float, help="cut the delivered track to this many seconds (with a fade)")
     m.add_argument("--full-length", action="store_true", help="with --master: undo an earlier --length")
@@ -355,22 +471,30 @@ def main() -> int:
     o.add_argument("--master", metavar="REQ", help="re-master a request's takes with the options above; no regeneration")
     o.add_argument("--show-prompt", action="store_true", help="print the prompt the engine would get, and exit")
     o.add_argument("--list", action="store_true", help="recent requests")
-    o.add_argument("--show", metavar="REQ", help="an earlier request: its prompt and ranked takes, with their files")
+    o.add_argument("--show", metavar="REQ|REF", help="an earlier request (or one take of it, REQ:SEED): its prompt "
+                   "and takes, with their files. With --out it delivers them like a new request")
+    o.add_argument("--export", metavar="REF", help="with --out: copy the take and every request it was made from "
+                   "(sources, parts, layers, all the way back) there, so it can be restored and rebuilt later")
     o.add_argument("--settings", action="store_true", help="show the defaults in effect")
     o.add_argument("--save-defaults", action="store_true", help="save the given --n, --duration, --engine, --steps, "
                    "--seed, --raw/--no-check, --lufs, --peak, --fade-in, --fade-out, --strength as your defaults "
                    "(config.local.json; the page and the API use them too); others stay as saved")
     o.add_argument("--reset-defaults", action="store_true", help="forget your saved defaults: back to the built-in ones")
     o.add_argument("--engines", action="store_true", help="engines: installed / running")
-    o.add_argument("--delete", metavar="REQ", help="delete a request's files from output/")
+    o.add_argument("--delete", metavar="REQ", help="delete a request's files from output/ (refused while another "
+                   "request was made from it: --export what you keep first)")
+    o.add_argument("--force", action="store_true", help="with --delete: delete even if other requests were made from it")
     d = ap.add_argument_group("delivery")
     d.add_argument("--out", type=Path, help="copy results here as <name>_vNN.wav/.mp3 + .json (never overwrites)")
     d.add_argument("--format", choices=["all", "wav", "mp3"], default="all", help="with --out: all (WAV + MP3, "
                    "the default), wav or mp3")
     d.add_argument("--best", type=int, default=1, help="with --out: how many of the best kept takes (default 1)")
     d.add_argument("--all", action="store_true", help="with --out: every kept take")
+    d.add_argument("--pick", metavar="SEEDS", help="with --out: deliver these takes (seeds, comma-separated), "
+                   "whatever their rank")
     d.add_argument("--png", action="store_true", help="with --out: copy the waveform/spectrogram PNGs too")
-    d.add_argument("--name", help="file name for delivered files (letters, digits, hyphens; default from the text)")
+    d.add_argument("--name", help="file name for delivered files (letters, digits, hyphens, underscores; default "
+                   "from the text)")
     d.add_argument("--play", action="store_true", help="play the best take on this machine's speakers")
     d.add_argument("--no-save", action="store_true", help="delete the request from output/ when done (after --out/--play)")
     d.add_argument("--json", action="store_true", help="print only JSON (the server's response plus `delivered`)")
@@ -383,10 +507,10 @@ def main() -> int:
     if len(sources) > 1:
         ap.error("use one of --extend, --vary, --inpaint, --combine, --mix, --import at a time")
     if not (a.text or sources or a.master or a.list or a.show or a.settings or a.save_defaults or a.reset_defaults
-            or a.engines or a.delete):
+            or a.engines or a.delete or a.export):
         ap.error("give the music to make, or --extend / --vary / --inpaint REF, --import FILE, --combine PARTS, "
                  "--mix LAYERS, --master REQ, --list, --show REQ, --settings, --save-defaults, --reset-defaults, "
-                 "--engines or --delete")
+                 "--engines, --delete or --export REF")
     layers = None
     if a.mix:
         if len(a.mix) < 2:
@@ -402,7 +526,7 @@ def main() -> int:
         if len(a.combine) < 2:
             ap.error("--combine needs at least two parts")
         try:
-            parts = [parse_part(x) for x in a.combine]
+            parts = [parse_combine_part(x) for x in a.combine]
         except ValueError as exc:
             ap.error(str(exc))
     if a.inpaint and not a.span:
@@ -413,7 +537,21 @@ def main() -> int:
             ap.error("--span takes START-END in seconds, e.g. 20-28")
         span = (float(mm.group(1)), float(mm.group(2)))
     if a.name is not None and not NAME.fullmatch(a.name):
-        ap.error("--name takes letters, digits and hyphens only")
+        ap.error("--name takes letters, digits, hyphens and underscores only")
+    picks = None
+    if a.pick:
+        try:
+            picks = [int(x) for x in a.pick.split(",") if x.strip()]
+        except ValueError:
+            ap.error("--pick takes seeds, comma-separated, e.g. --pick 1234,1236")
+        if not a.out:
+            ap.error("--pick chooses what --out delivers: give --out DIR too")
+    if a.export and not (REF.fullmatch(a.export) and a.out):
+        ap.error("--export takes a take's ref (REQ:SEED) and --out DIR")
+    if a.show and not (re.fullmatch(r"\s*[0-9]{8}-[0-9]{6}-[0-9a-f]{4}\s*", a.show) or REF.fullmatch(a.show)):
+        ap.error("--show takes a request id or a take's ref (REQ:SEED)")
+    if a.show and sources:
+        ap.error("--show shows an earlier request: use it without --extend/--vary/--inpaint/--combine/--mix/--import")
     if not wait_for_server(a.wait):
         print(f"No server at {SERVER}. Start it with start.cmd (agents: start.cmd --no-browser).", file=sys.stderr)
         return 1
@@ -446,21 +584,27 @@ def main() -> int:
             print(f"{k:7s} {e['label']:28s} {'installed' if e['installed'] else 'NOT installed'}"
                   f"{', running' if e['running'] else ''}")
         return 0
-    if a.show:
-        res = call(f"/api/requests/{a.show}")
-        if a.json:
-            print(json.dumps(res, indent=2, ensure_ascii=False))
-        else:
-            print_request(res)
-        return 0
     if a.list:
         for r in call("/api/requests?limit=30"):
             print(f"{r['id']}  {r.get('op') or 'generate':8s} {r.get('duration') or 0:6.1f}s  {r['takes']} take(s)  "
                   f"{r.get('name')}: {(r.get('text') or '')[:60]}")
         return 0
     if a.delete:
-        r = call(f"/api/requests/{a.delete}", method="DELETE")
+        r = call(f"/api/requests/{a.delete}" + ("?force=true" if a.force else ""), method="DELETE")
         print(f"deleted request {r['id']} ({r['deleted']} files)")
+        return 0
+    if a.export:
+        try:
+            files, chain = export(a.export, a.out, a.format, a.png, a.name)
+        except ValueError as exc:
+            ap.error(str(exc))
+        if a.json:
+            print(json.dumps({"take": a.export, "delivered": [str(f) for f in files], "requests": chain}, indent=2))
+        else:
+            print(f"exported {a.export} and the {len(chain)} request(s) it is made from to {a.out}:")
+            for f in files:
+                print(f"  {f}")
+            print(f"  {a.out / 'requests'}  ({', '.join(chain)})")
         return 0
     if a.show_prompt and sources:
         ap.error("--show-prompt shows a new request's prompt: use it without --extend/--vary/--inpaint/--combine/--mix/--import")
@@ -473,7 +617,34 @@ def main() -> int:
 
     # An audio file given to --extend / --vary / --inpaint is imported first (undescribed: the
     # text, if any, is the prompt for the new music, not a description of the file).
-    imported = []
+    made: dict = {"imported": [], "res": None}
+    try:
+        return _make_and_deliver(a, ap, layers, parts, span, picks, made)
+    finally:
+        res, imported = made["res"], made["imported"]
+        if res is None:  # the request failed (or never ran): the files imported for it are orphans
+            for rid in imported:
+                _delete_quietly(rid)
+        elif a.no_save and not (a.master or a.show):
+            for rid in [res["id"], *imported]:  # the request first: its imports are made into it
+                _delete_quietly(rid)
+            if not a.json:
+                print(f"not saved: removed request {res['id']}"
+                      + (f" and the import(s) {', '.join(imported)}" if imported else "") + " from output/")
+
+
+def _delete_quietly(rid: str) -> None:
+    """Delete a request this run made, during cleanup: a failure here mustn't hide the real error."""
+    try:
+        _OPENER.open(urllib.request.Request(f"{SERVER}/api/requests/{rid}", method="DELETE"), timeout=60).close()
+    except (OSError, http.client.HTTPException):
+        print(f"could not remove {rid} from output/", file=sys.stderr)
+
+
+def _make_and_deliver(a, ap, layers, parts, span, picks, made: dict) -> int:
+    """Everything after the arguments: imports, the request, delivery, playback. Every request it
+    creates is recorded in `made` as soon as it exists, so main() can clean up whatever happens."""
+    imported = made["imported"]
     for attr in ("extend", "vary", "inpaint"):
         val = getattr(a, attr)
         if val and not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}[:#/][0-9]+", val):
@@ -485,9 +656,29 @@ def main() -> int:
                 print(f"imported {val} as {imp['takes'][0]['ref']}")
             setattr(a, attr, imp["takes"][0]["ref"])
 
+    # Audio files among the mix's layers: imported as they are, silence and all, so `at` and any
+    # boost spans line up with the file's own timeline (a voice's word timings).
+    for ly in layers or []:
+        if "file" in ly:
+            f = ly.pop("file")
+            imp = upload(Path(f), check=False, trim=False)
+            imported.append(imp["id"])
+            ly["take"] = imp["takes"][0]["ref"]
+            if not a.json:
+                print(f"imported {f} as {ly['take']}")
+
     text = {"text": a.text} if a.text else {}
-    if a.import_file is not None:
-        res = upload(a.import_file, a.text, a.name, a.check, "stem" if a.stem else None)
+    if a.show:
+        m = REF.fullmatch(a.show)
+        rid, seed = (m["rid"], m["seed"]) if m else (a.show.strip(), "")
+        res = call(f"/api/requests/{rid}")
+        if seed:
+            res["takes"] = [t for t in res["takes"] if str(t["seed"]) == seed]
+            if not res["takes"]:
+                print(f"request {rid} has no take with seed {seed}", file=sys.stderr)
+                return 2
+    elif a.import_file is not None:
+        res = upload(a.import_file, a.text, a.name, a.check, "stem" if a.stem else None, trim=not a.keep_silence)
     elif a.mix:
         res = call("/api/mix", {"layers": layers, **master_fields(a), **given({"name": a.name, "check": a.check})})
     elif a.combine:
@@ -510,10 +701,20 @@ def main() -> int:
                                                                   "raw": a.raw, "negative": a.negative,
                                                                   "name": a.name})})
 
+    made["res"] = res
     kept = [t for t in res["takes"] if not t.get("rejected")]
     delivered: list[Path] = []
     if a.out:
-        pick = kept if a.all else kept[:max(1, a.best)]
+        if picks is not None:
+            pick = [t for t in res["takes"] if t["seed"] in picks]
+            if len(pick) != len(set(picks)):
+                have = ", ".join(str(t["seed"]) for t in res["takes"])
+                print(f"--pick: request {res['id']} has takes with seeds {have}", file=sys.stderr)
+                return 2
+        elif a.show and REF.fullmatch(a.show):
+            pick = res["takes"]  # the take asked for, whatever its rank
+        else:
+            pick = kept if a.all else kept[:max(1, a.best)]
         try:
             delivered = deliver(res, pick, a.out, a.format, png=a.png, name=a.name)
         except ValueError as exc:
@@ -528,26 +729,18 @@ def main() -> int:
             for p in delivered:
                 print(f"  {p}")
 
-    status = 0 if kept else 3
-    try:
-        if a.play:
-            target = next((p for p in delivered if p.suffix == ".wav"), None) or \
-                OUTPUT / (kept[0] if kept else res["takes"][0])["files"]["wav"]
-            try:
-                sys.stdout.flush()
-                play(target)
-                if not a.json:
-                    print(f"played {target.name}")
-            except Exception as exc:  # the take exists; only the playback failed
-                print(f"could not play {target}: {exc}", file=sys.stderr)
-                status = 1
-    finally:
-        if a.no_save and res.get("id") and not a.master:
-            for rid in [res["id"], *imported]:  # the file imported on the way, too
-                call(f"/api/requests/{rid}", method="DELETE")
+    status = 0 if (kept or a.show) else 3
+    if a.play:
+        target = next((p for p in delivered if p.suffix == ".wav"), None) or \
+            OUTPUT / (kept[0] if kept else res["takes"][0])["files"]["wav"]
+        try:
+            sys.stdout.flush()
+            play(target)
             if not a.json:
-                print(f"not saved: removed request {res['id']}" + (f" and the import {imported[0]}" if imported else "")
-                      + " from output/")
+                print(f"played {target.name}")
+        except Exception as exc:  # the take exists; only the playback failed
+            print(f"could not play {target}: {exc}", file=sys.stderr)
+            status = 1
     if status == 3 and not a.json:
         print("every take was rejected: try other seeds, or rephrase the prompt", file=sys.stderr)
     return status
