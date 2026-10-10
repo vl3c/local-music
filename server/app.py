@@ -105,6 +105,14 @@ def _own_origins(request) -> set[str]:
     return {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
 
+@app.exception_handler(PermissionError)
+async def _file_in_use(request, exc):
+    # Windows won't replace or delete a file another handle has open: the browser still
+    # streaming a take's MP3, an editor holding a WAV. audio.replace() retries for a while first.
+    return JSONResponse({"detail": f"a file is in use ({exc.filename or exc}): stop playing or downloading it, "
+                                   "then try again"}, status_code=409)
+
+
 _lock = threading.Lock()  # one GPU job at a time: generation and scoring share the card
 _file_lock = threading.Lock()  # settings: a small file that mustn't wait for a GPU job
 
@@ -439,7 +447,7 @@ def save_request(rec: dict) -> None:
     p = req_dir(rec["id"]) / "request.json"
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, p)
+    audio.replace(tmp, p)
 
 
 def parse_take(ref: str) -> tuple[str, int]:
@@ -496,18 +504,21 @@ def analyse(rec: dict, take: dict, x: np.ndarray, sr: int) -> None:
     take["music"] = mus
 
 
-def render(rec: dict, take: dict, opts: post.PostOpts) -> np.ndarray:
-    """Raw -> mastered audio + MP3 for one take. Updates take["post"] / ["final"]. Returns the audio.
+def master_take(rec: dict, take: dict, opts: post.PostOpts) -> tuple[np.ndarray, dict]:
+    """Raw -> mastered audio and its report, for one take. No side effects (so a request's takes
+    can all be mastered before anything is written, and a failure leaves them as they were);
+    thread-safe (numpy, soxr)."""
+    raw, sr = audio.read(req_dir(rec["id"]) / take["raw"])
+    return post.process(raw, sr, opts, take.get("beats"))
 
-    Thread-safe (numpy, soxr and libsndfile), so a request's takes render in parallel; the
-    plot (matplotlib isn't thread-safe) is draw()'s job, afterwards."""
-    d = req_dir(rec["id"])
-    raw, sr = audio.read(d / take["raw"])
-    y, rep = post.process(raw, sr, opts, take.get("beats"))
+
+def commit_take(rec: dict, take: dict, y: np.ndarray, rep: dict) -> None:
+    """Store a mastered take: its report in the record, its MP3 on disk (the WAV is written by
+    judge(), with the scores in its INFO chunk). Thread-safe (libsndfile)."""
+    rep = dict(rep)
     take["final"] = {"true_peak_dbtp": rep.pop("true_peak_dbtp"), "lufs": rep.pop("lufs")}
     take["post"] = rep
-    audio.write_mp3(d / take["mp3"], y)
-    return y
+    audio.write_mp3(req_dir(rec["id"]) / take["mp3"], y)
 
 
 def draw(rec: dict, take: dict, opts: post.PostOpts, y: np.ndarray) -> None:
@@ -523,14 +534,19 @@ def draw(rec: dict, take: dict, opts: post.PostOpts, y: np.ndarray) -> None:
 
 
 def render_all(rec: dict, opts: post.PostOpts, prepare=None) -> list[np.ndarray]:
-    """Render every take of a request, in parallel, then draw their plots. prepare(take), if
-    given, runs first in the take's thread (the analysis of a new take)."""
+    """Master every take of a request in parallel and only then write anything, so one take
+    failing (a loop longer than it, say) leaves every take as it was; then the MP3s and the
+    plots. prepare(take), if given, runs first in the take's thread (a new take's analysis)."""
     def one(t):
         if prepare is not None:
             prepare(t)
-        return render(rec, t, opts)
-    with ThreadPoolExecutor(max_workers=min(4, len(rec["takes"])) or 1) as ex:
-        finals = list(ex.map(one, rec["takes"]))
+        return master_take(rec, t, opts)
+    n = min(4, len(rec["takes"])) or 1
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        done = list(ex.map(one, rec["takes"]))  # raises before anything is written
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(lambda tr: commit_take(rec, tr[0], *tr[1]), zip(rec["takes"], done)))
+    finals = [y for y, _ in done]
     for t, y in zip(rec["takes"], finals):
         draw(rec, t, opts, y)
     return finals
@@ -731,6 +747,16 @@ def _source(ref: str) -> tuple[dict, dict, Path]:
     return src, take, req_dir(rid) / take["raw"]
 
 
+def _raw_offset(src: dict, take: dict, ref: str) -> float:
+    """Where the delivered track (what the player and the plot show) starts on the raw take's
+    timeline: spans are given in the former and cut from the latter. A loop has no single
+    mapping, so spans on one are refused."""
+    if take.get("post", {}).get("loop") is not None:
+        raise HTTPException(400, f"{ref} is delivered as a loop: give a span only on a whole track "
+                                 "(re-master it with loop_bars null first)")
+    return float(take.get("post", {}).get("trim_start_s", 0.0))
+
+
 def _from_take(req: FromTakeReq, op: str, **fields):
     """The shared part of extend / vary / inpaint: resolve settings, the source and its prompt."""
     saved = local_settings()
@@ -753,9 +779,9 @@ def _from_take(req: FromTakeReq, op: str, **fields):
 
 @app.post("/api/extend")
 def extend(req: ExtendReq):
-    """Continue a take: the engine hears it and writes what comes next. The result is the
-    whole track (source + new music). Past the engine's window (380 s for Medium), it hears
-    the end of the source only, and the beginning is put back in front, crossfaded."""
+    """Continue a take: the engine hears it (its last part, past the engine's 380 s window) and
+    writes what comes next. The result is the whole track: the source exactly as it was, then
+    the new music, crossfaded over 0.1 s where they meet."""
     opt, src, raw_path, common = _from_take(req, "extend")
     x, sr = audio.read(raw_path)
     src_s = x.shape[1] / sr
@@ -771,23 +797,19 @@ def extend(req: ExtendReq):
                           duration=round(src_s + req.seconds, 2), gen_length_s=round(context_s + req.seconds, 2),
                           **common)
         d = req_dir(rec["id"])
-        stitch = None
+        # The engine hears the last context_s of the source (all of it, if it fits) and writes
+        # what follows. It re-renders what it heard, too: the source is put back in front.
+        cut_n = x.shape[1] - int(round(context_s * sr))
+        head, ctx = x[:, :cut_n], x[:, cut_n:]
         ctx_path = raw_path
-        if context_s < src_s:
-            cut = x.shape[1] - int(context_s * sr)
-            head, ctx = x[:, :cut], x[:, cut:]
+        if cut_n > 0:
             ctx_path = d / "context.wav"
             audio.write_wav(ctx_path, ctx, sr, subtype="FLOAT")
-            xf = min(int(0.5 * sr), ctx.shape[1])
+        xf = int(post.KEEP_XFADE_S * sr)
 
-            def stitch(y: np.ndarray, ysr: int, head=head, ctx=ctx, xf=xf) -> np.ndarray:
-                # The engine re-renders the context it heard: the same music, but not the same
-                # waveform (measured -14 to -23 dB apart). Keep the original up to where the
-                # context starts, then cross from the original context into its rendering over
-                # half a second; from there on it's all the engine's.
-                t = np.linspace(0.0, np.pi / 2, xf, dtype=np.float32)
-                seam = ctx[:, :xf] * np.cos(t) + y[:, :xf] * np.sin(t)
-                return np.concatenate([head, seam, y[:, xf:]], axis=1)
+        def stitch(y: np.ndarray, ysr: int, head=head, ctx=ctx, xf=xf) -> np.ndarray:
+            n = ctx.shape[1] + int(round(req.seconds * ysr))
+            return np.concatenate([head, post.keep_outside(ctx, _fit(y, n), ctx.shape[1], n, xf)], axis=1)
         job = {"op": "generate", "prompt": rec["prompt"], "duration": context_s + req.seconds, "seeds": seeds,
                "steps": rec["steps"], "out_dir": str(d), "stem": "gen", "inpaint_audio": str(ctx_path),
                "mask_start": context_s, "mask_end": context_s + req.seconds}
@@ -810,20 +832,30 @@ def vary(req: VaryReq):
         length = min(x.shape[1] / sr, w.info["max_duration"])
         rec = _new_record("vary", opt, w.info, engine, seeds, strength=strength, duration=round(length, 2),
                           gen_length_s=round(length, 2), **common)
+        init = raw_path
+        if x.shape[1] / sr > length:  # longer than the engine's window: vary its first part
+            init = req_dir(rec["id"]) / "init.wav"
+            audio.write_wav(init, x[:, :int(length * sr)], sr, subtype="FLOAT")
+            rec["warnings"] = [f"the source is {x.shape[1] / sr:.0f} s: only its first {length:.0f} s (the engine's "
+                               "window) were varied"]
         job = {"op": "generate", "prompt": rec["prompt"], "duration": length, "seeds": seeds, "steps": rec["steps"],
-               "out_dir": str(req_dir(rec["id"])), "stem": "gen", "init_audio": str(raw_path),
+               "out_dir": str(req_dir(rec["id"])), "stem": "gen", "init_audio": str(init),
                "init_strength": strength}
-        return _run(rec, job, w, opt)
+        out = _run(rec, job, w, opt)
+        (req_dir(rec["id"]) / "init.wav").unlink(missing_ok=True)
+        return out
 
 
 @app.post("/api/inpaint")
 def inpaint(req: InpaintReq):
-    """Regenerate start..end (seconds, on the take's raw timeline) and keep the rest."""
+    """Regenerate start..end (seconds, as the take plays) and keep the rest as it was."""
     opt, src, raw_path, common = _from_take(req, "inpaint")
     x, sr = audio.read(raw_path)
     total = x.shape[1] / sr
-    if not req.start < req.end <= total + 1e-6:
-        raise HTTPException(400, f"the span must lie within the take (0..{total:.1f} s), start before end")
+    off = _raw_offset(src, find_take(src, parse_take(req.take)[1]), req.take)
+    start, end = req.start + off, req.end + off
+    if not start < end <= total + 1e-6:
+        raise HTTPException(400, f"the span must lie within the take (0..{total - off:.1f} s), start before end")
     with _lock:
         engine = opt["engine"] or src["engine"]
         w = _start(engine)
@@ -834,8 +866,13 @@ def inpaint(req: InpaintReq):
                           gen_length_s=round(total, 2), clap_prompt=src["prompt"], **common)
         job = {"op": "generate", "prompt": rec["prompt"], "duration": total, "seeds": seeds, "steps": rec["steps"],
                "out_dir": str(req_dir(rec["id"])), "stem": "gen", "inpaint_audio": str(raw_path),
-               "mask_start": req.start, "mask_end": req.end}
-        return _run(rec, job, w, opt)
+               "mask_start": start, "mask_end": end}
+        m0, m1, xf = int(round(start * sr)), int(round(end * sr)), int(post.KEEP_XFADE_S * sr)
+
+        def stitch(y: np.ndarray, ysr: int) -> np.ndarray:
+            # Only the span is the engine's: everything else is the take as it was.
+            return post.keep_outside(x, _fit(y, x.shape[1]), m0, m1, xf)
+        return _run(rec, job, w, opt, stitch)
 
 
 # --------------------------------------------------------------------------- your own audio
@@ -857,30 +894,37 @@ async def import_audio(request: Request, filename: str = Query(min_length=1, max
     size = int(request.headers.get("content-length") or 0)
     if size > MAX_IMPORT_BYTES:
         raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
-    data = await request.body()
+    data = bytearray()
+    async for chunk in request.stream():  # counted as it arrives: a chunked upload has no length
+        data += chunk
+        if len(data) > MAX_IMPORT_BYTES:
+            raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
     if not data:
         raise HTTPException(400, "no audio in the request body")
-    if len(data) > MAX_IMPORT_BYTES:
-        raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
+    data = bytes(data)
     return await run_in_threadpool(_import, data, filename, text, kind, name, check)
 
 
 def _import(data: bytes, filename: str, text: str | None, kind: str, name: str | None, check: bool | None) -> dict:
     import soundfile as sf
     base = Path(filename.replace("\\", "/")).name or "audio"
+    warnings = []
     try:
-        x, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+        with sf.SoundFile(io.BytesIO(data)) as f:
+            sr = f.samplerate
+            keep = int(MAX_IMPORT_S * sr)
+            if f.frames > keep:  # decode only what's kept: a long FLAC is gigabytes as float
+                warnings.append(f"only the first {MAX_IMPORT_S / 60:.0f} minutes were imported")
+            x = f.read(min(f.frames, keep) if f.frames > 0 else keep, dtype="float32", always_2d=True)
     except Exception as exc:
         raise HTTPException(400, f"can't read {base!r} as audio ({exc}). WAV, FLAC, OGG and MP3 work; "
                                  "convert other formats (M4A, AAC...) first") from exc
+    if not np.all(np.isfinite(x)):
+        raise HTTPException(400, f"{base!r} has samples that aren't numbers (NaN or infinity): it's damaged")
     x = np.ascontiguousarray(x.T)
     x = np.vstack([x, x]) if x.shape[0] == 1 else x[:2]
-    warnings = []
     if x.shape[1] < sr:
         raise HTTPException(400, f"{base!r} is shorter than a second")
-    if x.shape[1] > MAX_IMPORT_S * sr:
-        x = x[:, :int(MAX_IMPORT_S * sr)]
-        warnings.append(f"only the first {MAX_IMPORT_S / 60:.0f} minutes were imported")
     x = audio.resample(x, sr, RAW_SR)
     text = " ".join(text.split()) if text else ""
     opt = effective_settings()
@@ -894,7 +938,7 @@ def _import(data: bytes, filename: str, text: str | None, kind: str, name: str |
         rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "import", "engine": opt["engine"],
                "model": "imported", "seeds": [0], "steps": None, "takes": [], "kind": kind, "text": text,
                "prompt": prompt, "raw": False, "bpm": None, "key": None,
-               "name": name or prompts.track_name(Path(base).stem), "source": base,
+               "name": name or prompts.file_name(Path(base).stem), "source": base,
                "duration": round(x.shape[1] / RAW_SR, 2), "gen_length_s": round(x.shape[1] / RAW_SR, 2), "gen_s": 0.0,
                "post": default_master(opt, None), "warnings": warnings}
         path = d / "import.wav"
@@ -905,7 +949,6 @@ def _import(data: bytes, filename: str, text: str | None, kind: str, name: str |
 # --------------------------------------------------------------------------- arranging takes
 
 ARRANGE_CONTEXT_S = 20.0  # how much of each part the engine hears either side of a join
-ARRANGE_XFADE_S = 0.5     # original -> the engine's rendering of it, at the edges of each join
 
 
 class PartItem(BaseModel):
@@ -925,13 +968,6 @@ class ArrangeReq(ShapeFields):
     @classmethod
     def _not_blank(cls, v: str | None) -> str | None:
         return _clean_text(v)
-
-
-def _join(a: np.ndarray, b: np.ndarray, xf: int) -> np.ndarray:
-    """a then b, where a's last xf samples and b's first xf are the same moment: equal-power
-    crossfade across them."""
-    t = np.linspace(0.0, np.pi / 2, xf, dtype=np.float32)
-    return np.concatenate([a[:, :-xf], a[:, -xf:] * np.cos(t) + b[:, :xf] * np.sin(t), b[:, xf:]], axis=1)
 
 
 def _fit(y: np.ndarray, n: int) -> np.ndarray:
@@ -959,10 +995,11 @@ def _arrangement_warnings(parts: list[dict]) -> list[str]:
 
 @app.post("/api/arrange")
 def arrange(req: ArrangeReq):
-    """Several takes (or spans of them), in order, as one new song: at each join the engine hears
-    up to 20 s of the part before and after, and writes `bridge` seconds of new music between
-    them, regenerating `blend` seconds either side so the parts flow into it. Each take of the
-    result is the whole song, its bridges made with one seed."""
+    """Several takes (or spans of them, in seconds as they play), in order, as one new song: at
+    each join the engine hears up to 20 s of the part before and after, and writes `bridge`
+    seconds of new music between them, rewriting `blend` seconds either side so the parts flow
+    into it. Everything else is the parts' own audio. Each take of the result is the whole song,
+    its bridges made with one seed."""
     saved = local_settings()
     opt = _resolve(req, saved)
     parts = []
@@ -975,8 +1012,9 @@ def arrange(req: ArrangeReq):
         # writes a silent bridge): an inner edge starts or ends with the part's body, unless the
         # span sets it. The song's very start and end stay as they are.
         b0, b1 = analysis.body(x, sr)
-        a = item.start if item.start is not None else (b0 / sr if i > 0 else 0.0)
-        b = min(item.end, total) if item.end is not None else (b1 / sr if i < last else total)
+        off = _raw_offset(src, take, item.take) if (item.start is not None or item.end is not None) else 0.0
+        a = item.start + off if item.start is not None else (b0 / sr if i > 0 else 0.0)
+        b = min(item.end + off, total) if item.end is not None else (b1 / sr if i < last else total)
         if not 0 <= a < b or b - a < 4.0:
             raise HTTPException(400, f"part {item.take}: the span must be at least 4 s inside the take (0..{total:.1f} s)")
         parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)],
@@ -1000,7 +1038,8 @@ def arrange(req: ArrangeReq):
         rec = _new_record("arrange", opt, w.info, engine, seeds, kind=first.get("kind", "music"),
                           text=req.text or first.get("text", ""), prompt=prompt, raw=bool(first.get("raw")),
                           bpm=first.get("bpm"), key=first.get("key"), name=name[:60],
-                          parts=[{"take": p["ref"], "start": p["start"], "end": p["end"]} for p in parts],  # as used
+                          parts=[{"take": p["ref"], "name": p["src"]["name"], "start": p["start"], "end": p["end"]}
+                                 for p in parts],  # the spans as used
                           bridge=round(bridge, 2), blend=req.blend, duration=round(total_s, 2), post=po.asdict(),
                           clap_prompt=first["prompt"] or None, warnings=_arrangement_warnings(parts))
         d = req_dir(rec["id"])
@@ -1014,32 +1053,33 @@ def arrange(req: ArrangeReq):
             path = d / f"join{j}.wav"
             audio.write_wav(path, ctx, RAW_SR, subtype="FLOAT")
             ctx_s = ctx_n / RAW_SR
-            blend = max(0.0, min(req.blend, ctx_s - 2 * ARRANGE_XFADE_S))
+            blend = max(0.0, min(req.blend, ctx_s - 2 * post.KEEP_XFADE_S))
+            m0, m1 = ctx_s - blend, ctx_s + bridge + blend
             job = {"op": "generate", "prompt": prompt, "duration": ctx.shape[1] / RAW_SR, "seeds": seeds,
                    "steps": rec["steps"], "out_dir": str(d), "stem": f"join{j}", "inpaint_audio": str(path),
-                   "mask_start": ctx_s - blend, "mask_end": ctx_s + bridge + blend}
+                   "mask_start": m0, "mask_end": m1}
             reply = _call(rec, job, w)
-            joins.append({"ctx_n": ctx_n, "n": ctx.shape[1], "renders": {int(f["seed"]): f["path"] for f in reply["files"]}})
+            joins.append({"ctx_n": ctx_n, "n": ctx.shape[1], "ctx": ctx, "m0": int(round(m0 * RAW_SR)),
+                          "m1": int(round(m1 * RAW_SR)), "renders": {int(f["seed"]): f["path"] for f in reply["files"]}})
             path.unlink(missing_ok=True)
         rec["gen_s"] = round(time.time() - t0, 2)
         rec["gen_length_s"] = round(sum(jn["n"] for jn in joins) / RAW_SR, 2)
-        xf = int(ARRANGE_XFADE_S * RAW_SR)
+        xf = int(post.KEEP_XFADE_S * RAW_SR)
         files = []
         try:
             for seed in seeds:
-                # Part 0 up to its join (plus the crossfade), the join's rendering, part 1 from its
-                # side of that join (minus the crossfade) up to the next join, and so on. Every
-                # meeting of original and rendering is the same moment on both sides: crossfaded.
-                first_x = parts[0]["x"]
-                song = first_x[:, :first_x.shape[1] - joins[0]["ctx_n"] + xf]
+                # Each join's rendering, with the parts put back outside its bridge and blend
+                # (the engine re-renders the context it heard), starts and ends with the parts'
+                # own samples: the song is the parts and the joins laid end to end.
+                song = [parts[0]["x"][:, :parts[0]["x"].shape[1] - joins[0]["ctx_n"]]]
                 for j, jn in enumerate(joins):
                     r, _ = audio.read(jn["renders"][seed])
-                    song = _join(song, _fit(r, jn["n"]), xf)
+                    song.append(post.keep_outside(jn["ctx"], _fit(r, jn["n"]), jn["m0"], jn["m1"], xf))
                     q = parts[j + 1]["x"]
-                    end = q.shape[1] - joins[j + 1]["ctx_n"] + xf if j + 1 < len(joins) else q.shape[1]
-                    song = _join(song, q[:, jn["ctx_n"] - xf:end], xf)
+                    end = q.shape[1] - joins[j + 1]["ctx_n"] if j + 1 < len(joins) else q.shape[1]
+                    song.append(q[:, jn["ctx_n"]:end])
                 path = d / f"gen_{seed}.wav"
-                audio.write_wav(path, song, RAW_SR, subtype="FLOAT")
+                audio.write_wav(path, np.concatenate(song, axis=1), RAW_SR, subtype="FLOAT")
                 files.append({"seed": seed, "path": str(path)})
             for jn in joins:
                 for f in jn["renders"].values():
@@ -1083,12 +1123,13 @@ def mix(req: MixReq):
         total = y.shape[1] / sr
         a = item.start or 0.0
         b = total if item.end is None else min(item.end, total)
-        if not 0 <= a < b:
-            raise HTTPException(400, f"layer {item.take}: the span must lie inside the take (0..{total:.1f} s)")
+        if not 0 <= a or b - a < 0.1:
+            raise HTTPException(400, f"layer {item.take}: the span must lie inside the take (0..{total:.1f} s) "
+                                     "and last at least 0.1 s")
         layers.append(post.Layer(audio=y[:, int(a * sr):int(b * sr)], gain_db=item.gain_db, offset_s=item.at))
         srcs.append(src)
-        desc.append({"take": item.take, "gain_db": item.gain_db, "at": item.at, "start": round(a, 2),
-                     "end": round(b, 2)})
+        desc.append({"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
+                     "start": round(a, 2), "end": round(b, 2)})
     base = srcs[0]  # the first layer's prompt, tempo and key carry on (extending the mix uses them)
     with _lock:
         y, rep = post.mix_layers(layers, audio.SR)
@@ -1165,7 +1206,14 @@ def delete_request(rid: str):
         raise HTTPException(404, f"no request {rid}")
     with _lock:
         n = sum(1 for p in d.iterdir() if p.is_file())
-        shutil.rmtree(d)
+        for attempt in range(20):  # a file still being streamed to the browser holds the folder
+            try:
+                shutil.rmtree(d)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.1)
     return {"id": rid, "deleted": n}
 
 
@@ -1236,7 +1284,7 @@ def save_settings(new: Settings):
     tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
     with _file_lock:  # a reader never sees a half-written file
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp, SETTINGS_FILE)
+        audio.replace(tmp, SETTINGS_FILE)
     return get_settings()
 
 

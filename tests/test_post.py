@@ -125,3 +125,24 @@ def test_mix_places_and_scales_layers():
     assert m.shape == (2, 6 * sr) and rep["length_s"] == 6.0
     assert m[0, 100] == pytest.approx(0.5, abs=1e-3) and m[1, 4500] == pytest.approx(1.5, abs=1e-3)
     assert m[0, 5500] == pytest.approx(1.0)
+
+
+def test_keep_outside_puts_the_original_back_around_the_new_part():
+    n = 10000
+    x = np.vstack([np.linspace(0, 1, n, dtype=np.float32)] * 2)
+    r = np.full((2, n), 5.0, np.float32)  # "the engine": different everywhere
+    out = post.keep_outside(x, r, 4000, 6000, 100)
+    assert np.array_equal(out[:, :3900], x[:, :3900]) and np.array_equal(out[:, 6100:], x[:, 6100:])
+    assert np.all(out[:, 4000:6000] == 5.0)
+    assert 0 < out[0, 3950] - x[0, 3950] < 5  # crossfading in...
+    # identical signals across a linear crossfade stay identical (no +3 dB bump)
+    same = post.keep_outside(x, x.copy(), 4000, 6000, 100)
+    assert np.allclose(same, x, atol=1e-6)
+
+
+def test_keep_outside_extends_where_the_original_ends():
+    x = np.ones((2, 1000), np.float32)
+    r = np.full((2, 1500), 2.0, np.float32)
+    out = post.keep_outside(x, r, 1000, 1500, 50)  # an extension: the mask runs to the end
+    assert out.shape == (2, 1500) and np.all(out[:, :950] == 1.0) and np.all(out[:, 1000:] == 2.0)
+    assert 1.0 < out[0, 975] < 2.0

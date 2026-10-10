@@ -9,13 +9,29 @@ an MP3 for sharing.
 from __future__ import annotations
 
 import io
+import os
 import struct
+import time
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
 SR = 48000  # every delivered file
+
+
+def replace(src: Path | str, dst: Path | str, tries: int = 40, wait_s: float = 0.05) -> None:
+    """os.replace, retried for a couple of seconds: Windows refuses to replace a file another
+    handle has open (the browser streaming a take, a reader mid-read). Raises PermissionError
+    if it never frees up."""
+    for k in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if k == tries - 1:
+                raise
+            time.sleep(wait_s)
 
 
 def as2d(x: np.ndarray) -> np.ndarray:
@@ -118,7 +134,7 @@ def write_wav(path: Path | str, x: np.ndarray, sr: int = SR, info: dict[str, str
     path = Path(path)
     tmp = path.with_name(path.name + ".part")
     tmp.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
-    tmp.replace(path)
+    replace(tmp, path)
     return path
 
 
@@ -148,5 +164,5 @@ def write_mp3(path: Path | str, x: np.ndarray, sr: int = SR, kbps: int = 320) ->
                       compression_level=min(1.0, max(0.0, (320 - kbps) / (320 - 32))),
                       bitrate_mode="CONSTANT") as f:
         f.write(x.T)
-    tmp.replace(path)
+    replace(tmp, path)
     return path

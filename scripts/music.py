@@ -336,7 +336,8 @@ def main() -> int:
     m.add_argument("--length", type=float, help="cut the delivered track to this many seconds (with a fade)")
     m.add_argument("--full-length", action="store_true", help="with --master: undo an earlier --length")
     m.add_argument("--fade-in", type=float, help="seconds (default 0)")
-    m.add_argument("--fade-out", type=float, help="seconds (default 0; a take that ends abruptly warns)")
+    m.add_argument("--fade-out", type=float, help="seconds (default: automatic, a 3 s fade only when the take stops "
+                   "at full level; 0 keeps a hard cut)")
     m.add_argument("--lufs", type=float, help="loudness target (default -14, streaming level; -16..-18 for "
                    "background music under dialogue)")
     m.add_argument("--peak", type=float, help="true-peak ceiling in dBTP (default -1)")
@@ -426,6 +427,8 @@ def main() -> int:
         r = call(f"/api/requests/{a.delete}", method="DELETE")
         print(f"deleted request {r['id']} ({r['deleted']} files)")
         return 0
+    if a.show_prompt and sources:
+        ap.error("--show-prompt shows a new request's prompt: use it without --extend/--vary/--inpaint/--combine/--mix/--import")
     if a.show_prompt and a.text:
         q = urllib.parse.urlencode(given({"text": a.text, "bpm": a.bpm, "key": a.key,
                                           "kind": "stem" if a.stem else "music", "raw": "true" if a.raw else None}))
@@ -435,12 +438,14 @@ def main() -> int:
 
     # An audio file given to --extend / --vary / --inpaint is imported first (undescribed: the
     # text, if any, is the prompt for the new music, not a description of the file).
+    imported = []
     for attr in ("extend", "vary", "inpaint"):
         val = getattr(a, attr)
         if val and not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}[:#/][0-9]+", val):
             if not is_audio_file(val):
                 ap.error(f"--{attr} takes a take's ref (REQ:SEED) or an audio file (WAV, FLAC, OGG, MP3), not {val!r}")
             imp = upload(Path(val), check=False)
+            imported.append(imp["id"])
             if not a.json:
                 print(f"imported {val} as {imp['takes'][0]['ref']}")
             setattr(a, attr, imp["takes"][0]["ref"])
@@ -503,9 +508,11 @@ def main() -> int:
                 status = 1
     finally:
         if a.no_save and res.get("id") and not a.master:
-            call(f"/api/requests/{res['id']}", method="DELETE")
+            for rid in [res["id"], *imported]:  # the file imported on the way, too
+                call(f"/api/requests/{rid}", method="DELETE")
             if not a.json:
-                print(f"not saved: removed request {res['id']} from output/")
+                print(f"not saved: removed request {res['id']}" + (f" and the import {imported[0]}" if imported else "")
+                      + " from output/")
     if status == 3 and not a.json:
         print("every take was rejected: try other seeds, or rephrase the prompt", file=sys.stderr)
     return status

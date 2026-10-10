@@ -195,8 +195,9 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   rewrites details; 0.5-0.7 rewrites the notes; a new text steers the variation.
 - **Longer**: `--extend <ref> --seconds S` (repeatable; past 380 s it continues from the last
   part). The result is the whole track.
-- **One bad section**: `--inpaint <ref> --span A-B` (seconds on the take's timeline), with a
-  new text for that part if wanted ("a drum break", "the strings drop out").
+- **One bad section**: `--inpaint <ref> --span A-B` (seconds as the take plays: read them off its PNG), with a
+  new text for that part if wanted ("a drum break", "the strings drop out"). Everything outside the span stays
+  exactly as it was (the same holds for extend and for the parts of a combine).
 - **Different length, loudness, fades, or a loop**: `--master <request id> ...`, no
   regeneration.
 - **From the user's own audio**: `--import <file> "what it is"`, then work from its ref; or pass

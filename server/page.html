@@ -8,6 +8,7 @@
 :root { --bg:#f5f5f2; --fg:#1b1b1b; --card:#fff; --muted:#666; --line:#dcdcd6; --acc:#2a62c9; --bad:#b3261e; --warn:#9a6700; --ok:#1e7a3c; --chip:#eef0f4; }
 @media (prefers-color-scheme: dark) { :root { --bg:#151618; --fg:#e7e7e7; --card:#202124; --muted:#9a9a9a; --line:#36383c; --acc:#6c9eff; --bad:#ff8a80; --warn:#e3b341; --ok:#5fd38a; --chip:#2b2d31; } }
 * { box-sizing:border-box; }
+[hidden] { display:none !important; }
 body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
 header { display:flex; gap:12px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); }
 header h1 { font-size:18px; margin:0; }
@@ -54,6 +55,15 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
 .small { font-size:12px; color:var(--muted); }
 #msg { margin:8px 0; font-size:13px; color:var(--bad); }
 .working { text-align:center; padding:40px 14px; color:var(--muted); }
+#progress { position:sticky; top:0; z-index:5; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:10px; font-size:13px; color:var(--muted); }
+#progress .bar { height:3px; margin-top:6px; border-radius:2px; background:linear-gradient(90deg, transparent, var(--acc), transparent); background-size:40% 100%; background-repeat:no-repeat; animation:slide 1.2s linear infinite; }
+@keyframes slide { from { background-position:-40% 0; } to { background-position:140% 0; } }
+#view.dim .takes, #view.dim .reqhead { opacity:.45; pointer-events:none; }
+.act { grid-template-columns:auto 1fr auto; }
+.act select { padding:4px 6px; font-size:12px; width:auto; }
+.examples { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin-top:10px; }
+.examples button { font-size:12px; padding:4px 10px; border-radius:14px; }
+.count { font-size:11px; background:var(--acc); color:#fff; border-radius:9px; padding:0 7px; margin-left:6px; vertical-align:1px; }
 #big { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; align-items:center; justify-content:center; z-index:60; }
 #big img { max-width:96vw; max-height:94vh; } #big.on { display:flex; }
 .part { display:grid; grid-template-columns:1fr 84px auto auto; gap:4px; align-items:center; padding:4px 0; border-bottom:1px dashed var(--line); font-size:12px; }
@@ -119,7 +129,7 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
   <input id="filetext" placeholder="what it is (optional), e.g. a slow acoustic folk song" style="margin-top:6px" title="Describes the audio: it becomes the prompt later work continues from. Empty: the engine is led by the audio alone.">
   <button class="wide" id="importbtn" style="margin-top:6px">Import</button>
 
-  <h2>Song</h2>
+  <h2>Song<span class="count" id="songcount" hidden></span></h2>
   <div class="seg" id="songmode">
     <button data-mode="join" title="One after another, with new music written at each join">Join in order</button>
     <button data-mode="mix" title="On top of each other (a voice over a song), each at its own volume">Mix on top</button>
@@ -140,7 +150,8 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
   <div class="history" id="history"></div>
 </section>
 
-<section id="view"><div class="working small">Describe some music and press Generate (Ctrl+Enter).</div></section>
+<section id="view"><div class="working small">Describe some music and press Generate (Ctrl+Enter), or start from one of these:
+  <div class="examples" id="examples"></div></div></section>
 </main>
 <div id="big"><img alt=""></div>
 
@@ -150,16 +161,18 @@ const $ = id => document.getElementById(id);
 const FIELDS = ["duration", "n", "lufs", "peak_dbtp", "fade_in", "fade_out", "seed", "engine", "raw", "check"];
 let settings = null, current = null, busy = false;
 
+function errText(data, fallback) {
+  let d = data && data.detail;
+  if (Array.isArray(d)) d = d.map(x => (x.loc || []).slice(1).join(".") + ": " + x.msg).join("; ");
+  return d || fallback;
+}
+
 async function api(path, body, method) {
   const opt = body === undefined ? {method: method || "GET"} : {method: method || "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
   const r = await fetch(path, opt);
   let data = null;
   try { data = await r.json(); } catch (e) { /* no body */ }
-  if (!r.ok) {
-    let d = data && data.detail;
-    if (Array.isArray(d)) d = d.map(x => (x.loc || []).slice(1).join(".") + ": " + x.msg).join("; ");
-    throw new Error(d || r.statusText);
-  }
+  if (!r.ok) throw new Error(errText(data, r.statusText));
   return data;
 }
 
@@ -208,9 +221,22 @@ function preview() {
 
 function setBusy(b, what) {
   busy = b;
-  $("go").disabled = b;
+  $("go").disabled = b; $("importbtn").disabled = b; $("combine").disabled = b;
   document.querySelectorAll(".card button, .reqhead button").forEach(x => x.disabled = b);
-  if (b) { $("view").replaceChildren(el("div", {class: "working", text: what + "... (the first one after a start loads the engine: ~40 s)"})); }
+  const old = $("progress");
+  if (old) old.remove();
+  $("view").classList.toggle("dim", b);
+  if (b) {
+    const t0 = Date.now();
+    const label = el("span", {text: what + "..."});
+    const banner = el("div", {id: "progress"}, label, el("div", {class: "bar"}));
+    $("view").prepend(banner);
+    const tick = setInterval(() => {
+      if (!document.body.contains(banner)) { clearInterval(tick); return; }
+      const s = Math.round((Date.now() - t0) / 1000);
+      label.textContent = what + "... " + s + " s" + (s > 20 ? "  (the first request after a start also loads the engine, ~40 s)" : "");
+    }, 1000);
+  }
 }
 
 async function run(path, payload, what) {
@@ -241,7 +267,6 @@ function chips(t) {
   return c;
 }
 
-function action(label, input, btn) { return el("div", {class: "act"}, el("span", {text: label}), input, btn); }
 
 function card(res, t) {
   const f = t.files;
@@ -259,35 +284,43 @@ function card(res, t) {
   c.append(el("div", {class: "btns"},
     el("a", {class: "button", href: "/files/" + f.wav, download: res.name + "_" + t.seed + ".wav", text: "WAV"}),
     el("a", {class: "button", href: "/files/" + f.mp3, download: res.name + "_" + t.seed + ".mp3", text: "MP3"}),
-    el("button", {text: "Add to song", title: "Add this take to the Song on the left: takes there are joined in order, with new music at each join", onclick: () => addPart(t.ref, res.name, t.signal && t.signal.duration_s)}),
+    el("button", {text: inSong(t.ref) ? "✓ In song" : "Add to song", title: "Add this take to the Song on the left: join takes one after another, or mix them on top of each other", onclick: e => { addPart(t.ref, res.name, t.signal && t.signal.duration_s); e.target.textContent = "✓ In song"; }}),
     el("span", {class: "small", text: t.ref})));
-  const secs = el("input", {type: "number", min: "2", max: "360", value: "30", title: "seconds of new music"});
-  const str = el("input", {type: "number", min: "0.05", max: "1", step: "0.05", value: "0.5", title: "0.1 close, 0.5 same style new notes, 1 unrelated"});
-  const span = el("input", {placeholder: "e.g. 20-28", title: "seconds: the span to regenerate"});
+  const ACTIONS = {
+    extend: {label: "Extend by (s)", value: "30", hint: "seconds of new music after this take (uses the prompt box if you changed it)"},
+    vary: {label: "Vary at strength", value: "0.5", hint: "0.1 close to this take, 0.5 same sound with new notes, 1 unrelated"},
+    inpaint: {label: "Redo span (s)", value: "", hint: "START-END seconds to regenerate, e.g. 20-28; the rest stays"},
+  };
+  const pick = el("select", {title: "What to make from this take"},
+    ...Object.entries(ACTIONS).map(([k, v]) => el("option", {value: k, text: v.label})));
+  const val = el("input", {value: ACTIONS.extend.value, title: ACTIONS.extend.hint});
+  pick.addEventListener("change", () => { const a = ACTIONS[pick.value]; val.value = a.value; val.title = a.hint; val.placeholder = pick.value === "inpaint" ? "e.g. 20-28" : ""; });
   const txt = () => $("text").value.trim() && $("text").value.trim() !== res.text ? {text: $("text").value.trim()} : {};
-  c.append(
-    action("Extend by", secs, el("button", {text: "Extend", title: "Continue this take (uses the prompt box if you changed it)", onclick: () => run("/api/extend", {take: t.ref, seconds: Number(secs.value), ...txt()}, "Extending")})),
-    action("Variation", str, el("button", {text: "Vary", title: "Variations of this take: the engine starts from it", onclick: () => run("/api/vary", {take: t.ref, strength: Number(str.value), ...txt()}, "Making variations")})),
-    action("Redo span", span, el("button", {text: "Inpaint", title: "Regenerate this span, keep the rest", onclick: () => {
-      const m = /^\s*([\d.]+)\s*-\s*([\d.]+)\s*$/.exec(span.value);
-      if (!m) { $("msg").textContent = "span: START-END in seconds, e.g. 20-28"; return; }
-      run("/api/inpaint", {take: t.ref, start: Number(m[1]), end: Number(m[2]), ...txt()}, "Inpainting");
-    }})));
+  const go = () => {
+    const v = val.value.trim();
+    if (pick.value === "extend") return run("/api/extend", {take: t.ref, seconds: Number(v) || 30, ...txt()}, "Extending");
+    if (pick.value === "vary") return run("/api/vary", {take: t.ref, strength: Number(v) || 0.5, ...txt()}, "Making variations");
+    const m = /^\s*([\d.]+)\s*-\s*([\d.]+)\s*$/.exec(v);
+    if (!m) { $("msg").textContent = "Redo span: START-END in seconds, e.g. 20-28"; return; }
+    run("/api/inpaint", {take: t.ref, start: Number(m[1]), end: Number(m[2]), ...txt()}, "Redoing " + v + " s");
+  };
+  val.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  c.append(el("div", {class: "act"}, pick, val, el("button", {text: "Go", onclick: go})));
   return c;
 }
 
 function show(res) {
   current = res;
   const what = (res.op || "generate") + (res.source ? " of " + res.source : "") +
-    (res.parts ? " of " + res.parts.length + " parts, bridges of " + res.bridge + " s" : "") +
-    (res.layers ? " of " + res.layers.map(l => l.take.split(":")[1] + " " + dbText(l.gain_db) + (l.at ? " at " + l.at + " s" : "")).join(" + ") : "");
+    (res.parts ? " of " + res.parts.map(p => p.name || p.take.split(":")[1]).join(" → ") + ", bridges of " + res.bridge + " s" : "") +
+    (res.layers ? " of " + res.layers.map(l => (l.name || l.take.split(":")[1]) + " " + dbText(l.gain_db) + (l.at ? " at " + l.at + " s" : "")).join(" + ") : "");
   const loopBars = el("input", {type: "number", min: "1", max: "64", value: (res.post && res.post.loop_bars) || 4, style: "width:70px"});
   const head = el("div", {class: "reqhead"},
     el("h2", {text: res.name}),
     el("div", {class: "sub", text: res.id + "  ·  " + what + "  ·  " + res.engine + "  ·  " + res.takes.length + " take(s), " + res.kept + " kept  ·  " + (res.gen_s != null ? res.gen_s + " s + " + res.score_s + " s checks" : "")}),
     el("div", {class: "sub", text: res.prompt}),
     el("div", {class: "btns"},
-      el("button", {text: "Re-master with panel settings", title: "Loudness, fades, loop and length from the panel; no regeneration", onclick: () => {
+      el("button", {text: "Re-master", title: "Apply the panel's loudness, fades and loop settings (under Mastering and fine-tuning) to every take here; nothing is regenerated", onclick: () => {
         const b = {request: res.id}; for (const k of ["lufs", "peak_dbtp", "fade_in", "fade_out", "beats_per_bar"]) { const v = num(k); if (v != null) b[k] = v; }
         b.loop_bars = num("loop_bars"); run("/api/master", b, "Re-mastering");
       }}),
@@ -296,7 +329,11 @@ function show(res) {
       res.post && res.post.loop_bars ? el("button", {text: "Whole tracks", onclick: () => run("/api/master", {request: res.id, loop_bars: null}, "Re-mastering")}) : null,
       el("button", {class: "link", text: "delete", onclick: async () => {
         if (!confirm("Delete every file of " + res.id + "?")) return;
-        await api("/api/requests/" + res.id, undefined, "DELETE"); current = null; $("view").replaceChildren(); history();
+        try {
+          await api("/api/requests/" + res.id, undefined, "DELETE");
+          song = song.filter(p => !p.take.startsWith(res.id + ":")); saveSong(); drawSong();
+          current = null; $("view").replaceChildren(); history();
+        } catch (e) { $("msg").textContent = e.message; }
       }})));
   for (const w of res.warnings || []) head.append(el("div", {class: "warn", text: w}));
   const grid = el("div", {class: "takes"});
@@ -308,7 +345,7 @@ function show(res) {
 async function history() {
   try {
     const list = await api("/api/requests?limit=40");
-    $("history").replaceChildren(...list.map(r => el("div", {"data-id": r.id, class: current && current.id === r.id ? "cur" : "", onclick: async () => { if (!busy) show(await api("/api/requests/" + r.id)); }},
+    $("history").replaceChildren(...list.map(r => el("div", {"data-id": r.id, class: current && current.id === r.id ? "cur" : "", onclick: async () => { if (busy) return; try { show(await api("/api/requests/" + r.id)); } catch (e) { $("msg").textContent = e.message; } }},
       el("span", {text: (r.name || r.id) + " "}), el("span", {class: "tag", text: (r.op || "generate") + " · " + Math.round(r.duration || 0) + " s"}))));
   } catch (e) { /* the status line says why */ }
 }
@@ -352,7 +389,7 @@ $("importbtn").addEventListener("click", async () => {
     if ($("filetext").value.trim()) q.set("text", $("filetext").value.trim());
     const r = await fetch("/api/import?" + q, {method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: f});
     const data = await r.json();
-    if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : r.statusText);
+    if (!r.ok) throw new Error(errText(data, r.statusText));
     show(data); history();
   } catch (e) { $("msg").textContent = e.message; if (current) show(current); else $("view").replaceChildren(); }
   finally { setBusy(false); }
@@ -362,18 +399,21 @@ $("importbtn").addEventListener("click", async () => {
 let song = [], songMode = "join";
 try { song = JSON.parse(localStorage.getItem("local-music-song") || "[]"); songMode = localStorage.getItem("local-music-song-mode") || "join"; } catch (e) { song = []; }
 function saveSong() { try { localStorage.setItem("local-music-song", JSON.stringify(song)); localStorage.setItem("local-music-song-mode", songMode); } catch (e) { /* private window */ } }
-function addPart(ref, name, dur) { song.push({take: ref, name: name, dur: dur, span: "", gain: 0, at: 0}); saveSong(); drawSong(); }
+function inSong(ref) { return song.some(p => p.take === ref); }
+function addPart(ref, name, dur) {
+  if (inSong(ref)) { $("msg").textContent = "That take is already in the song."; return; } song.push({take: ref, name: name, dur: dur, span: "", gain: 0, at: 0}); saveSong(); drawSong(); }
 function dbText(v) { return (v > 0 ? "+" : "") + Number(v).toFixed(1) + " dB"; }
 function drawSong() {
   const has = song.length > 0, mix = songMode === "mix";
   document.querySelectorAll("#songmode button").forEach(b => b.classList.toggle("on", b.dataset.mode === songMode));
   $("songempty").hidden = has; $("songbtns").hidden = !has;
+  $("songcount").hidden = !has; $("songcount").textContent = String(song.length);
   $("songopts").hidden = !has || mix; $("bridgetext").hidden = !has || mix;
   $("combine").textContent = mix ? "Mix" : "Combine";
   $("song").replaceChildren(...song.map((p, i) => {
     if (p.gain == null) p.gain = 0;
     if (p.at == null) p.at = 0;
-    const span = el("input", {value: p.span, placeholder: "all" + (p.dur ? " (" + Math.round(p.dur) + " s)" : ""), title: "Use only START-END seconds of this take, e.g. 20-60, or 30- (from 30 s to the end). Empty: all of it."});
+    const span = el("input", {value: p.span, placeholder: "all" + (p.dur ? " (" + Math.round(p.dur) + " s)" : ""), title: "Use only START-END seconds of this take, as it plays (the player and the picture), e.g. 20-60, or 30- (from 30 s to the end). Empty: all of it."});
     span.addEventListener("input", () => { p.span = span.value; saveSong(); });
     const row = el("div", {class: "part"},
       el("span", {title: p.take, text: (i + 1) + ". " + p.name + " · " + p.take.split(":")[1]}), span,
@@ -417,6 +457,18 @@ $("combine").addEventListener("click", () => {
   run("/api/arrange", b, "Writing the bridges");
 });
 drawSong();
+
+const EXAMPLES = [
+  ["Lo-fi beat", "A warm lo-fi hip hop beat with dusty piano chords, soft vinyl crackle and a laid-back boom bap groove", 84],
+  ["Epic orchestral", "An epic orchestral cinematic score with soaring strings, French horns and thundering taiko drums, building to a triumphant climax", null],
+  ["Synthwave", "Dark synthwave night drive, pulsing analog bass, gated reverb drums, neon arpeggios", 100],
+  ["Ambient", "Calm ambient soundscape with evolving warm synth pads, gentle field recordings and distant chimes", null],
+  ["Chiptune", "8-bit chiptune boss battle theme, fast arpeggios, square wave lead and noise-channel drums", 160],
+  ["Solo piano", "A gentle solo piano ballad, intimate and tender", null],
+];
+if ($("examples")) $("examples").replaceChildren(...EXAMPLES.map(([label, text, bpm]) => el("button", {text: label, title: text, onclick: () => {
+  $("text").value = text; $("bpm").value = bpm == null ? "" : bpm; $("kind").value = /solo piano/i.test(text) ? "stem" : "music"; preview(); $("text").focus();
+}})));
 
 loadSettings().catch(() => {});
 history(); status(); setInterval(status, 5000);

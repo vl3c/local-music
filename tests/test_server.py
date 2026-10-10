@@ -271,7 +271,7 @@ def wav_bytes(x, sr=SR) -> bytes:
 
 def test_import_makes_a_take_the_rest_can_start_from(client, server):
     data = wav_bytes(band(100, 15.0, stereo=False, sr=48000), 48000)
-    r = client.post("/api/import", params={"filename": "C:\music\My Song.wav"}, content=data,
+    r = client.post("/api/import", params={"filename": r"C:\music\My Song.wav"}, content=data,
                     headers={"Content-Type": "application/octet-stream"})
     assert r.status_code == 200, r.text
     res = r.json()
@@ -328,6 +328,7 @@ def test_arrange_bridges_parts_into_one_song(client, server):
     assert jobs[0]["duration"] == pytest.approx(10 + 4 + 10, abs=0.01)
     assert (jobs[0]["mask_start"], jobs[0]["mask_end"]) == (pytest.approx(9.0), pytest.approx(15.0))
     assert res["op"] == "arrange" and [p["take"] for p in res["parts"]] == [a, b, c]
+    assert all(p["name"] == "steady-test-groove" for p in res["parts"])
     for t in res["takes"]:
         assert t["signal"]["duration_s"] == pytest.approx(30 + 20 + 20 + 2 * 4.0, abs=0.05)
     assert not list((server.OUTPUT / res["id"]).glob("join*")) and not list((server.OUTPUT / res["id"]).glob("gen_*"))
@@ -358,6 +359,7 @@ def test_mix_puts_a_voice_over_the_music_at_set_volumes(client, server):
     t = res["takes"][0]
     assert res["op"] == "mix" and len(server._fake.jobs) == n_jobs  # nothing generated
     assert [(ly["take"], ly["gain_db"], ly["at"]) for ly in res["layers"]] == [(song, -9, 0), (vref, 0, 5)]
+    assert [ly["name"] for ly in res["layers"]] == ["steady-test-groove", "voice"]
     assert t["signal"]["duration_s"] == pytest.approx(20.0, abs=0.05) and t["ref"].endswith(":0")
     assert res["prompt"] == client.get(f"/api/requests/{song.split(':')[0]}").json()["prompt"]  # the first layer's
     # The mix is a take like any other: it can be extended.
@@ -373,3 +375,130 @@ def test_mix_runs_as_long_as_its_longest_layer_and_validates(client):
     assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "start": 30}]}).status_code == 400
     assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "gain_db": 40}]}).status_code == 422
     assert client.post("/api/mix", json={"layers": [{"take": a}]}).status_code == 422
+
+
+# ------------------------------------------------------------------ what the engine writes, and what it doesn't
+
+def raw_of(server, ref):
+    from music import audio
+    rid, seed = ref.split(":")
+    rec = json.loads((server.OUTPUT / rid / "request.json").read_text(encoding="utf-8"))
+    t = next(t for t in rec["takes"] if t["seed"] == int(seed))
+    return audio.read(server.OUTPUT / rid / t["raw"])[0], t
+
+
+def noisy_engine(server, monkeypatch):
+    """The fake engine writes loud noise everywhere it was asked for audio: whatever of the
+    source survives in the result, the server put back."""
+    from music import audio
+
+    def call(job):
+        server._fake.jobs.append(job)
+        files = []
+        for s in job["seeds"]:
+            x = np.random.default_rng(s).standard_normal((2, int(job["duration"] * SR))).astype(np.float32) * 0.3
+            p = Path(job["out_dir"]) / f"{job['stem']}_{s}.wav"
+            audio.write_wav(p, x, SR, subtype="FLOAT")
+            files.append({"seed": s, "path": str(p)})
+        return {"ok": True, "files": files, "sample_rate": SR}
+    monkeypatch.setattr(server._fake, "call", call)
+
+
+def test_inpaint_keeps_everything_outside_the_span(client, server, monkeypatch):
+    src = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    x, _ = raw_of(server, src)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/inpaint", json={"take": src, "start": 8, "end": 12, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape == x.shape
+    assert np.array_equal(y[:, :8 * SR - xf], x[:, :8 * SR - xf]) and np.array_equal(y[:, 12 * SR + xf:], x[:, 12 * SR + xf:])
+    assert not np.allclose(y[:, 9 * SR:11 * SR], x[:, 9 * SR:11 * SR])
+
+
+def test_extend_keeps_the_source_in_front(client, server, monkeypatch):
+    src = gen(client, n=1, duration=15)["takes"][0]["ref"]
+    x, _ = raw_of(server, src)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/extend", json={"take": src, "seconds": 5, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape[1] == x.shape[1] + 5 * SR
+    assert np.array_equal(y[:, :x.shape[1] - xf], x[:, :x.shape[1] - xf])
+    # past the window: the head and the context are both the source
+    server._fake.info["max_duration"] = 18.0  # hears 13 s of the 15 s source
+    res = client.post("/api/extend", json={"take": src, "seconds": 5, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    assert server._fake.jobs[-1]["duration"] == pytest.approx(18.0, abs=0.01)
+    assert y.shape[1] == x.shape[1] + 5 * SR and np.array_equal(y[:, :x.shape[1] - xf], x[:, :x.shape[1] - xf])
+
+
+def test_arrange_keeps_the_parts_and_writes_only_the_joins(client, server, monkeypatch):
+    a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    xa, _ = raw_of(server, a)
+    xb, _ = raw_of(server, b)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20},
+                                                     {"take": b, "start": 0, "end": 20}],
+                                           "bridge": 2, "blend": 1, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape[1] == 42 * SR
+    cut = 19 * SR - xf  # part a is itself up to its blend (1 s before its end) minus the crossfade
+    assert np.array_equal(y[:, :cut], xa[:, :cut])
+    tail = 42 * SR - (23 * SR + xf)  # part b is itself from 1 s past the bridge (+ crossfade)
+    assert np.array_equal(y[:, -tail:], xb[:, -tail:])
+    assert not np.allclose(y[:, 20 * SR:22 * SR], 0)  # the bridge is the engine's
+
+
+def test_spans_follow_the_player_not_the_raw_take(client, server):
+    x = np.concatenate([np.zeros((2, int(1.5 * 48000)), np.float32), band(100, 12.0, sr=48000)], axis=1)
+    imp = client.post("/api/import", params={"filename": "late.wav"}, content=wav_bytes(x, 48000)).json()
+    t = imp["takes"][0]
+    assert t["post"]["trim_start_s"] == pytest.approx(1.5, abs=0.12)
+    client.post("/api/inpaint", json={"take": t["ref"], "start": 2, "end": 3, "n": 1})
+    job = server._fake.jobs[-1]
+    off = t["post"]["trim_start_s"]
+    assert job["mask_start"] == pytest.approx(2 + off) and job["mask_end"] == pytest.approx(3 + off)
+
+
+def test_spans_on_a_loop_are_refused(client):
+    res = gen(client, n=1, duration=30, bpm=120)
+    client.post("/api/master", json={"request": res["id"], "loop_bars": 4})
+    r = client.post("/api/inpaint", json={"take": res["takes"][0]["ref"], "start": 1, "end": 2})
+    assert r.status_code == 400 and "loop" in r.json()["detail"]
+
+
+def test_a_failed_remaster_changes_nothing(client, server):
+    res = gen(client, n=2, duration=12, bpm=120)
+    d = server.OUTPUT / res["id"]
+    rec = json.loads((d / "request.json").read_text(encoding="utf-8"))
+    rec["takes"][1]["beats"] = []  # this take can't be looped
+    (d / "request.json").write_text(json.dumps(rec), encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in d.iterdir() if p.suffix in (".mp3", ".wav", ".png", ".json")}
+    r = client.post("/api/master", json={"request": res["id"], "loop_bars": 2})
+    assert r.status_code == 400
+    after = {p.name: p.read_bytes() for p in d.iterdir() if p.suffix in (".mp3", ".wav", ".png", ".json")}
+    assert after == before
+
+
+def test_odd_imports_are_4xx_or_rejected_not_500(client):
+    nan = band(100, 3.0, sr=48000)
+    nan[0, 100] = np.nan
+    import io
+
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, nan.T, 48000, format="WAV", subtype="FLOAT")
+    assert client.post("/api/import", params={"filename": "nan.wav"}, content=buf.getvalue()).status_code == 400
+    quiet = np.zeros((1, 3 * 48000), np.float32)
+    quiet[0, 1000] = 0.004  # one click at -48 dBFS
+    r = client.post("/api/import", params={"filename": "quiet.wav"}, content=wav_bytes(quiet, 48000))
+    assert r.status_code == 200 and r.json()["takes"][0]["rejected"]
+
+
+def test_a_mix_span_too_short_is_400(client):
+    a = gen(client, n=1, duration=10)["takes"][0]["ref"]
+    r = client.post("/api/mix", json={"layers": [{"take": a}, {"take": a, "start": 1.0, "end": 1.00001}]})
+    assert r.status_code == 400

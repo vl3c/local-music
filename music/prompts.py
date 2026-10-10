@@ -59,3 +59,12 @@ def track_name(text: str, words: int = 4) -> str:
     'warm-lofi-hip-hop'. Letters, digits and hyphens only."""
     toks = [t for t in re.findall(r"[a-z0-9]+", text.lower().replace("-", "")) if t not in STOP and not t.isdigit()]
     return "-".join(toks[:words]) or "track"
+
+
+def file_name(stem: str, words: int = 4) -> str:
+    """A track name from an imported file's name: '20261010171131-44b6_fx-demon_room' ->
+    'fx-demon-room'. Separators are any non-letter-digit; tokens that are mostly digits (dates,
+    take ids, hashes) are dropped."""
+    toks = [t for t in re.findall(r"[a-z0-9]+", stem.lower())
+            if sum(ch.isdigit() for ch in t) * 2 < len(t)]
+    return "-".join(toks[:words]) or "audio"

@@ -84,9 +84,17 @@ python scripts\music.py "a drum fill and a riser" --combine <intro ref> <main re
 |---|---|---|
 | **extend** `--extend REF --seconds S` | hears the take and writes the next S seconds (inpainting past its end) | the whole, longer track |
 | **vary** `--vary REF --strength X` | starts from the take instead of from noise (audio-to-audio): 0.1 is close, 0.5 keeps the style and sound but rewrites the notes, 1 is unrelated | variations, same length |
-| **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span, keeps the rest, joins it musically | the whole track |
+| **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span (seconds as the take plays), joins it musically | the whole track, the rest exactly as it was |
 
-A new text replaces the prompt for that part (default: the source's).
+A new text replaces the prompt for that part (default: the source's). Extending past the
+engine's 380 s window works too: it hears the last part of the track.
+
+**Only the new part is the engine's.** The engine re-renders everything it hears, not just
+what it was asked to write: the same music, but not the same waveform (measured 14-23 dB apart),
+and a voice would come back as the model's imitation of one. So the server puts the original
+back everywhere outside the region the engine was asked to write (after the source for extend,
+the span for inpaint, the bridge and blend for joins), with 0.1 s linear crossfades where they
+meet. Tests check this sample for sample. A vary is the exception by nature: it's all new.
 
 ### Your own audio
 
@@ -122,11 +130,12 @@ typically wants the song at -6 to -12.
 order. At each join the engine hears up to 20 s of the part before and after, writes `--bridge`
 seconds of new music between them (default 2 bars at the first part's tempo, 4 s without one;
 0 blends the parts straight into each other) and rewrites `--blend` seconds (default 1) of each
-part beside it so they flow into it. The parts are otherwise kept as they were: the edges where
-original and rendering meet are crossfaded over half a second. The text describes the bridges
+part beside it so they flow into it. Everything else is the parts' own audio, sample for
+sample. The text describes the bridges
 ("a big drum fill and a rising synth sweep"; default: the first part's prompt).
 
-- A part can be a span of a take: `REF@20-60` (seconds; `REF@30-` from 30 s to the end).
+- A part can be a span of a take: `REF@20-60` (seconds as the take plays, as on its picture;
+  `REF@30-` from 30 s to the end). Spans can't be taken from a take delivered as a loop.
 - At inner joins a part is cut to its *body*: a fade-out, a final chord dying away or silence
   before a join (and a fade-in after one) would tell the engine the music had ended, and it
   wrote silent bridges. A span you give sets that edge yourself; the song's very start and end
@@ -139,10 +148,7 @@ original and rendering meet are crossfaded over half a second. The text describe
 Measured: an intro (pads, no drums), a main part (drums, bass, lead) and an outro, each made
 separately at 100 BPM, joined with "a big drum fill and a rising synth sweep": 109 s at 100.0
 BPM, CE 7.4, PQ 8.2, no warnings; the drums build in across the first bridge, and the bar grid
-runs through both joins unbroken. Extending past the
-engine's 380 s window works too: it hears the last part of the track and the beginning is put
-back in front, crossfaded over half a second where the original meets the engine's rendering
-of it. (The engine re-renders whatever it hears: the same music, not the same waveform.)
+runs through both joins unbroken.
 
 ### Re-mastering
 
@@ -268,8 +274,8 @@ full output goes to `logs\server.log`, timestamped. Each start keeps the previou
 | `POST /api/extend` | `{"take", "seconds"?, "text"?, + shape and mastering}` | the same, for the longer track |
 | `POST /api/vary` | `{"take", "strength"?, "text"?, ...}` | variations |
 | `POST /api/inpaint` | `{"take", "start", "end", "text"?, ...}` | the take with that span redone |
-| `POST /api/import?filename=&text=&kind=&name=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
-| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?}, ...], "name"?, + mastering}` | the mix, as one take (seed 0) |
+| `POST /api/import?filename=&text=&kind=&name=&check=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
+| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?}, ...], "name"?, "check"?, + mastering}` | the mix, as one take (seed 0) |
 | `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
 | `POST /api/master` | `{"request", "length"?, "fade_in"?, "fade_out"?, "lufs"?, "peak_dbtp"?, "loop_bars"?, "beats_per_bar"?, "bpm"?}` | the request, re-mastered (`null` clears `length` / `loop_bars`) |
 | `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>` | | list, one, delete |
