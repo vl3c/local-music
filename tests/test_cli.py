@@ -178,7 +178,7 @@ def test_export_copies_the_take_and_everything_it_was_made_from(tmp_path, monkey
     out = tmp_path / "output"
     views = {res["id"]: {**res, "op": "mix", "layers": [{"take": "20261010-110000-0001:7"},
                                                         {"take": "20261010-110000-0002:0"}]},
-             "20261010-110000-0001": {"id": "20261010-110000-0001", "op": "inpaint", "source": "20261010-100000-0003:7",
+             "20261010-110000-0001": {"id": "20261010-110000-0001", "op": "inpaint", "source": "20261010-100000-0003#7",
                                       "takes": []},
              "20261010-110000-0002": {"id": "20261010-110000-0002", "op": "import", "source": "voice.wav", "takes": []},
              "20261010-100000-0003": {"id": "20261010-100000-0003", "op": "generate", "takes": []}}
@@ -199,6 +199,70 @@ def test_export_copies_the_take_and_everything_it_was_made_from(tmp_path, monkey
 
 
 def test_sources_of_a_request():
-    assert cli.sources_of({"source": "20261010-100000-0003:7"}) == ["20261010-100000-0003:7"]
-    assert cli.sources_of({"source": "voice.wav", "layers": [{"take": "20261010-100000-0003:1"}]}) ==         ["20261010-100000-0003:1"]
-    assert cli.sources_of({"parts": [{"take": "a:1"}, {"take": "b:2"}]}) == ["a:1", "b:2"]
+    assert cli.sources_of({"source": "20261010-100000-0003:7"}) == ["20261010-100000-0003"]
+    assert cli.sources_of({"source": "voice.wav", "layers": [{"take": "20261010-100000-0003:1"}]}) == \
+        ["20261010-100000-0003"]
+    # every way the server reads a ref: REQ:SEED, REQ#SEED, REQ/SEED, spaces around
+    assert cli.sources_of({"parts": [{"take": "20261010-100000-0004#1"}, {"take": " 20261010-100000-0005/2 "},
+                                     {"take": "not a ref"}]}) == ["20261010-100000-0004", "20261010-100000-0005"]
+
+
+
+def run_main(monkeypatch, argv, views, fail_call=None):
+    """main() against a fake server: `views` are the requests it holds; fail_call makes that
+    path fail the way call() does (a message and exit 2). Returns (exit status, deleted ids)."""
+    deleted, uploads = [], []
+    monkeypatch.setattr(cli, "wait_for_server", lambda s: True)
+    monkeypatch.setattr(cli, "_delete_quietly", deleted.append)
+
+    def call(path, payload=None, **k):
+        if fail_call and path.startswith(fail_call):
+            raise SystemExit(2)
+        return views[path.rsplit("/", 1)[1]]
+
+    def upload(path, *a, **k):
+        uploads.append((path, k))
+        rid = f"20261010-130000-000{len(uploads)}"
+        return {"id": rid, "takes": [{"ref": f"{rid}:0"}]}
+    monkeypatch.setattr(cli, "call", call)
+    monkeypatch.setattr(cli, "upload", upload)
+    monkeypatch.setattr(sys, "argv", ["music.py", *argv])
+    try:
+        status = cli.main()
+    except SystemExit as exc:
+        status = exc.code
+    return status, deleted, uploads
+
+
+def test_show_only_shows_even_rejected_takes(tmp_path, monkeypatch, capsys):
+    res = fake_result(tmp_path, monkeypatch)
+    for t in res["takes"]:
+        t["rejected"], t["fails"] = True, ["silent"]
+    res["kept"] = 0
+    status, deleted, _ = run_main(monkeypatch, ["--show", res["id"]], {res["id"]: res})
+    assert status == 0 and not deleted and "every take was rejected" not in capsys.readouterr().err
+    status, _, _ = run_main(monkeypatch, ["--show", f"{res['id']}#6", "--out", str(tmp_path / "d")],
+                            {res["id"]: dict(res, takes=list(res["takes"]))})
+    assert status == 0 and [p.name for p in (tmp_path / "d").glob("*.wav")] == ["warm-lofi_v01.wav"]
+    side = json.loads((tmp_path / "d" / "warm-lofi_v01.json").read_text(encoding="utf-8"))
+    assert side["ref"].endswith(":6")  # the take asked for, though it ranks second
+
+
+def test_a_failed_mix_removes_the_files_it_imported(tmp_path, monkeypatch):
+    ref = "20261010-120000-abcd:5"
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"x")
+    status, deleted, uploads = run_main(monkeypatch, ["--mix", ref, f"{voice},at=4,voice"], {}, fail_call="/api/mix")
+    assert status == 2 and deleted == ["20261010-130000-0001"]
+    assert uploads[0][1]["trim"] is False  # a mix's file keeps its timeline
+
+
+def test_no_save_removes_the_request_then_its_imports(tmp_path, monkeypatch):
+    res = fake_result(tmp_path, monkeypatch, seeds=(0,))
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"x")
+    views = {"mix": res}
+    monkeypatch.setattr(cli, "SERVER", "http://127.0.0.1:8192")
+    status, deleted, _ = run_main(monkeypatch, ["--mix", "20261010-120000-abcd:5", str(voice), "--no-save"],
+                                  {**views, "mix": res})
+    assert status == 0 and deleted == [res["id"], "20261010-130000-0001"]

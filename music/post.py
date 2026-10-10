@@ -448,7 +448,10 @@ def speech_margin(voice: np.ndarray, rest: np.ndarray, sr: int) -> dict:
         return {"median_db": None, "p10_db": None, "under": []}
     ev = 10 * np.log10(np.mean(v[: k * w].reshape(k, w) ** 2, axis=1) + 1e-12)
     eo = 10 * np.log10(np.mean(o[: k * w].reshape(k, w) ** 2, axis=1) + 1e-12)
-    active = ev > np.percentile(ev, 95) - 20.0
+    present = ev > -90.0  # where the voice layer has any sound at all (it's zeros outside itself)
+    if not np.any(present):
+        return {"median_db": None, "p10_db": None, "under": []}
+    active = present & (ev > np.percentile(ev[present], 95) - 20.0)
     if not np.any(active):
         return {"median_db": None, "p10_db": None, "under": []}
     m = ev - eo

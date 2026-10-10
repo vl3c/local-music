@@ -223,7 +223,8 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   delivered at -17. Nothing is ducked or levelled for you: the user decides the balance, so
   ask, or offer two or three balances (song at -6 / -9 / -12) rather than picking one silently.
   Layers are mixed before their own limiter, so a sung or shouted last word keeps its punch.
-  Per layer: `boost=A-B:+4` (louder there, e.g. a held last word; repeatable), `reverb=room`
+  Per layer: `boost=A-B:+4` (louder there, on the take's own timeline, e.g. a held last word;
+  repeatable), `reverb=room`
   (a dry voice sits better in the music; `hall`/`cathedral` for more), and `voice`, which
   warns where the voice falls under the music in the speech band: words there may be lost.
   The warning is a proxy: if the local-voice tool is installed, its Whisper is the real check.

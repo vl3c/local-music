@@ -127,7 +127,8 @@ takes: each is the take's delivered track (what you hear: its fades, cut or loop
 loudness), at its own volume (`vol=`, dB, default 0) starting at its own time (`at=`, seconds,
 default 0), optionally a span (`REF@10-40`). A layer can be an audio file: it's imported first,
 silence and all, so `at` and the spans below line up with the file's own timeline. The mix runs
-as long as its longest layer. Nothing levels or ducks the layers: the balance is yours. The
+as long as its longest layer, and keeps its silence: a layer at `at=4` starts 4 s into the
+delivered mix. Nothing levels or ducks the layers: the balance is yours. The
 sum is mastered like any take (so the overall loudness is the usual -14 LUFS and the volumes
 set the balance between layers), and it's a take itself: extend it, loop it, re-master it, or
 mix it again.
@@ -137,8 +138,9 @@ mix it again.
   apart at vol=0; a voice over a busy song typically wants the song another -6 to -12.
 - **Layers are mixed before their own limiter**: the mix is limited once, as a whole, so a
   voice's loud moments (a shouted or sung last word) come through as they were.
-- **Edits per layer**: `boost=START-END:DB` raises or lowers it there (seconds on the layer's
-  own timeline; repeatable; 30 ms ramps), e.g. `boost=60.9-63.5:+4` for a held last word;
+- **Edits per layer**: `boost=START-END:DB` raises or lowers it there (seconds on the take's
+  timeline as it plays, like `@START-END`, not the mix's; for a file, the file's own timeline;
+  repeatable; 30 ms ramps), e.g. `boost=60.9-63.5:+4` for a held last word;
   `reverb=room|hall|cathedral` puts a dry layer in a space (a light room: `room`), keeping its
   loudness, so its `vol` means the same.
 - **`voice` marks speech**: the mix measures, while it speaks, how far the voice sits above

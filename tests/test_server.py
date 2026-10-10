@@ -574,6 +574,14 @@ def test_a_layer_joins_the_mix_before_its_own_limiter(client, server):
     assert rise(y) == pytest.approx(20 * np.log10(0.9 / 0.1), abs=1.0)
     ly = res["layers"][1]
     assert ly["lufs"] == pytest.approx(t["final"]["lufs"], abs=0.5)  # how loud it plays (its target, before its limiter)
+    # an excerpt plays as loud as it is, not as the whole take: its quiet half
+    x = (0.3 * np.sin(2 * np.pi * 1000 * np.arange(8 * 48000) / 48000)).astype(np.float32)[None, :]
+    x[:, :4 * 48000] *= 0.1  # -20 dB for the first 4 s
+    two = client.post("/api/import", params={"filename": "two.wav"}, content=wav_bytes(x, 48000)).json()["takes"][0]
+    whole = client.post("/api/mix", json={"layers": [{"take": song, "gain_db": -40}, {"take": two["ref"]}]}).json()
+    part = client.post("/api/mix", json={"layers": [{"take": song, "gain_db": -40},
+                                                    {"take": two["ref"], "start": 0.5, "end": 3.5}]}).json()
+    assert part["layers"][1]["lufs"] < whole["layers"][1]["lufs"] - 10
 
 
 def test_mix_layer_spans_reverb_and_the_voice_check(client, server):
@@ -635,3 +643,20 @@ def test_a_request_others_are_made_from_isnt_deleted_unless_forced(client, serve
 def test_names_may_have_underscores(client):
     assert gen(client, n=1, name="boss_theme-v2")["name"] == "boss_theme-v2"
     assert client.post("/api/generate", json={"text": "x", "name": "no spaces"}).status_code == 422
+
+
+
+def test_a_mix_keeps_its_timeline_and_spans_land_where_asked(client, server):
+    from music import audio
+    v = voice_import(client, seconds=8.0, trim=False)["takes"][0]  # 1 s of silence, then the voice
+    song = gen(client, n=1, duration=12)["takes"][0]["ref"]
+    body = {"layers": [{"take": song, "gain_db": -60, "at": 3}, {"take": v["ref"], "at": 2, "start": 1.0,
+                                                                  "spans": [{"start": 4, "end": 5, "gain_db": 12}]}],
+            "lufs": -30, "fade_out": 0}
+    res = client.post("/api/mix", json=body).json()
+    assert res["takes"][0]["post"].get("trim_start_s", 0.0) == 0.0  # every layer starts late: nothing trimmed
+    y, _ = audio.read(server.OUTPUT / res["id"] / "0.wav")
+    rms = lambda a, b: np.sqrt(np.mean(y[:, int(a * 48000):int(b * 48000)] ** 2))  # noqa: E731
+    # the voice's 4-5 s (as the take plays) sits at 2 + (4 - 1) = 5..6 s in the mix, 12 dB up
+    assert 20 * np.log10(rms(5.1, 5.9) / rms(3.1, 3.9)) == pytest.approx(12.0, abs=1.5)
+    assert rms(0.0, 1.9) < 1e-4  # silence until the first layer starts

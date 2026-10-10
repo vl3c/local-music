@@ -49,7 +49,7 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 OUTPUT = Path(__file__).resolve().parent.parent / "output"
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
-REF = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}:[0-9]+$")
+REF = re.compile(r"^\s*(?P<rid>[0-9]{8}-[0-9]{6}-[0-9a-f]{4})[:#/](?P<seed>[0-9]+)\s*$")  # as the server reads one
 PART = re.compile(r"^(?P<ref>[0-9]{8}-[0-9]{6}-[0-9a-f]{4}:[0-9]+)(?:@(?P<a>\d+(?:\.\d+)?)?-(?P<b>\d+(?:\.\d+)?)?)?$")
 AUDIO_EXT = (".wav", ".flac", ".ogg", ".mp3")
 
@@ -132,7 +132,8 @@ def parse_combine_part(spec: str) -> dict:
 
 
 LAYER_HELP = ("REF[@START-END] or an audio file, then any of ,vol=DB ,at=SECONDS ,reverb=room|hall|cathedral "
-              ",boost=START-END:DB (louder or quieter there, seconds on the layer's own timeline; repeatable) "
+              ",boost=START-END:DB (louder or quieter there: seconds on the take's timeline as it plays, like @START-END; "
+              "repeatable) "
               ",voice (speech: checked for staying clear of the rest)")
 
 
@@ -257,9 +258,9 @@ def deliver(res: dict, takes: list[dict], out: Path, fmt: str, png: bool, name: 
 
 
 def sources_of(view: dict) -> list[str]:
-    """The takes a request was made from (as the API shows it): its source, parts and layers."""
-    refs = [view["source"]] if isinstance(view.get("source"), str) and REF.fullmatch(view["source"]) else []
-    return refs + [x["take"] for k in ("parts", "layers") for x in view.get(k) or []]
+    """The request ids a request was made from (as the API shows it): its source's, parts', layers'."""
+    refs = [view.get("source")] + [x.get("take") for k in ("parts", "layers") for x in view.get(k) or []]
+    return [m["rid"] for r in refs if isinstance(r, str) and (m := REF.fullmatch(r))]
 
 
 EXPORT_README = """This folder holds a take made with local-music and everything it was made from.
@@ -276,21 +277,24 @@ local-music's output/ folder: every ref in the chain works as before, e.g. {ref}
 def export(ref: str, out: Path, fmt: str, png: bool, name: str | None) -> tuple[list[Path], list[str]]:
     """A take and every request it was made from (sources, parts, layers, all the way back),
     copied into `out`: the take as <name>_vNN.*, the requests' folders under requests/."""
-    rid, _, seed = ref.partition(":")
+    m = REF.fullmatch(ref)
+    if not m:
+        raise ValueError(f"--export takes a take's ref (REQ:SEED), not {ref!r}")
+    rid, seed = m["rid"], m["seed"]
     chain: dict[str, dict] = {}
     todo = [rid]
     while todo:
         r = todo.pop()
         if r not in chain:
             chain[r] = call(f"/api/requests/{r}")
-            todo += [x.split(":")[0] for x in sources_of(chain[r])]
+            todo += sources_of(chain[r])
     dst = out / "requests"
     dst.mkdir(parents=True, exist_ok=True)
     for r in chain:
         if not (dst / r).exists():
             shutil.copytree(OUTPUT / r, dst / r)
     root = chain[rid]
-    takes = [t for t in root["takes"] if str(t["seed"]) == seed] if seed else root["takes"][:1]
+    takes = [t for t in root["takes"] if str(t["seed"]) == seed]
     if not takes:
         raise ValueError(f"request {rid} has no take with seed {seed}")
     files = deliver(root, takes, out, fmt, png=png, name=name)
@@ -544,7 +548,7 @@ def main() -> int:
             ap.error("--pick chooses what --out delivers: give --out DIR too")
     if a.export and not (REF.fullmatch(a.export) and a.out):
         ap.error("--export takes a take's ref (REQ:SEED) and --out DIR")
-    if a.show and not (re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}", a.show) or REF.fullmatch(a.show)):
+    if a.show and not (re.fullmatch(r"\s*[0-9]{8}-[0-9]{6}-[0-9a-f]{4}\s*", a.show) or REF.fullmatch(a.show)):
         ap.error("--show takes a request id or a take's ref (REQ:SEED)")
     if a.show and sources:
         ap.error("--show shows an earlier request: use it without --extend/--vary/--inpaint/--combine/--mix/--import")
@@ -613,7 +617,34 @@ def main() -> int:
 
     # An audio file given to --extend / --vary / --inpaint is imported first (undescribed: the
     # text, if any, is the prompt for the new music, not a description of the file).
-    imported = []
+    made: dict = {"imported": [], "res": None}
+    try:
+        return _make_and_deliver(a, ap, layers, parts, span, picks, made)
+    finally:
+        res, imported = made["res"], made["imported"]
+        if res is None:  # the request failed (or never ran): the files imported for it are orphans
+            for rid in imported:
+                _delete_quietly(rid)
+        elif a.no_save and not (a.master or a.show):
+            for rid in [res["id"], *imported]:  # the request first: its imports are made into it
+                _delete_quietly(rid)
+            if not a.json:
+                print(f"not saved: removed request {res['id']}"
+                      + (f" and the import(s) {', '.join(imported)}" if imported else "") + " from output/")
+
+
+def _delete_quietly(rid: str) -> None:
+    """Delete a request this run made, during cleanup: a failure here mustn't hide the real error."""
+    try:
+        _OPENER.open(urllib.request.Request(f"{SERVER}/api/requests/{rid}", method="DELETE"), timeout=60).close()
+    except (OSError, http.client.HTTPException):
+        print(f"could not remove {rid} from output/", file=sys.stderr)
+
+
+def _make_and_deliver(a, ap, layers, parts, span, picks, made: dict) -> int:
+    """Everything after the arguments: imports, the request, delivery, playback. Every request it
+    creates is recorded in `made` as soon as it exists, so main() can clean up whatever happens."""
+    imported = made["imported"]
     for attr in ("extend", "vary", "inpaint"):
         val = getattr(a, attr)
         if val and not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}[:#/][0-9]+", val):
@@ -638,7 +669,8 @@ def main() -> int:
 
     text = {"text": a.text} if a.text else {}
     if a.show:
-        rid, _, seed = a.show.partition(":")
+        m = REF.fullmatch(a.show)
+        rid, seed = (m["rid"], m["seed"]) if m else (a.show.strip(), "")
         res = call(f"/api/requests/{rid}")
         if seed:
             res["takes"] = [t for t in res["takes"] if str(t["seed"]) == seed]
@@ -669,6 +701,7 @@ def main() -> int:
                                                                   "raw": a.raw, "negative": a.negative,
                                                                   "name": a.name})})
 
+    made["res"] = res
     kept = [t for t in res["takes"] if not t.get("rejected")]
     delivered: list[Path] = []
     if a.out:
@@ -678,7 +711,7 @@ def main() -> int:
                 have = ", ".join(str(t["seed"]) for t in res["takes"])
                 print(f"--pick: request {res['id']} has takes with seeds {have}", file=sys.stderr)
                 return 2
-        elif a.show and ":" in a.show:
+        elif a.show and REF.fullmatch(a.show):
             pick = res["takes"]  # the take asked for, whatever its rank
         else:
             pick = kept if a.all else kept[:max(1, a.best)]
@@ -696,26 +729,18 @@ def main() -> int:
             for p in delivered:
                 print(f"  {p}")
 
-    status = 0 if kept else 3
-    try:
-        if a.play:
-            target = next((p for p in delivered if p.suffix == ".wav"), None) or \
-                OUTPUT / (kept[0] if kept else res["takes"][0])["files"]["wav"]
-            try:
-                sys.stdout.flush()
-                play(target)
-                if not a.json:
-                    print(f"played {target.name}")
-            except Exception as exc:  # the take exists; only the playback failed
-                print(f"could not play {target}: {exc}", file=sys.stderr)
-                status = 1
-    finally:
-        if a.no_save and res.get("id") and not (a.master or a.show):
-            for rid in [res["id"], *imported]:  # the file imported on the way, too
-                call(f"/api/requests/{rid}", method="DELETE")
+    status = 0 if (kept or a.show) else 3
+    if a.play:
+        target = next((p for p in delivered if p.suffix == ".wav"), None) or \
+            OUTPUT / (kept[0] if kept else res["takes"][0])["files"]["wav"]
+        try:
+            sys.stdout.flush()
+            play(target)
             if not a.json:
-                print(f"not saved: removed request {res['id']}"
-                      + (f" and the import(s) {', '.join(imported)}" if imported else "") + " from output/")
+                print(f"played {target.name}")
+        except Exception as exc:  # the take exists; only the playback failed
+            print(f"could not play {target}: {exc}", file=sys.stderr)
+            status = 1
     if status == 3 and not a.json:
         print("every take was rejected: try other seeds, or rephrase the prompt", file=sys.stderr)
     return status

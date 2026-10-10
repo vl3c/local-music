@@ -1207,7 +1207,7 @@ def mix(req: MixReq):
         srcs.append(src)
         d = {"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
              "start": round(a, 2), "end": round(b, 2),
-             "lufs": round(lrep["lufs"] + item.gain_db, 1)}  # how loud it plays in the mix, before mastering
+             "lufs": round(analysis.lufs(part, sr) + item.gain_db, 1)}  # as it plays in the mix, before mastering
         if item.spans:
             d["spans"] = [sp.model_dump() for sp in item.spans]
         if item.reverb != "none":
@@ -1223,7 +1223,8 @@ def mix(req: MixReq):
         rid = new_id()
         d = OUTPUT / rid
         d.mkdir(parents=True)
-        po = master_opts(default_master(opt, base.get("bpm")), req)
+        # The mix's timeline is the layers' (`at`): its silence stays, so word timings line up.
+        po = master_opts({**default_master(opt, base.get("bpm")), "trim_silence": False}, req)
         rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "mix", "engine": base["engine"],
                "model": "mix", "seeds": [0], "steps": None, "takes": [], "kind": base.get("kind", "music"),
                "text": base.get("text", ""), "prompt": base["prompt"], "raw": bool(base.get("raw")),
@@ -1309,9 +1310,10 @@ def list_requests(limit: int = 20):
 
 
 def sources_of(rec: dict) -> list[str]:
-    """The takes (refs) a request was made from: its source, its parts, its layers."""
-    refs = [rec["source"]] if isinstance(rec.get("source"), str) and TAKE_REF.fullmatch(rec["source"]) else []
-    return refs + [x["take"] for k in ("parts", "layers") for x in rec.get(k) or [] if isinstance(x, dict) and "take" in x]
+    """The request ids a request was made from: its source's, its parts', its layers'."""
+    refs = [rec.get("source")] + [x.get("take") for k in ("parts", "layers") for x in rec.get(k) or []
+                                  if isinstance(x, dict)]
+    return [m["rid"] for r in refs if isinstance(r, str) and (m := TAKE_REF.fullmatch(r.strip()))]
 
 
 def users_of(rid: str) -> list[str]:
@@ -1322,8 +1324,8 @@ def users_of(rid: str) -> list[str]:
             rec = json.loads((d / "request.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if any(parse_take(r)[0] == rid for r in sources_of(rec) if TAKE_REF.fullmatch(r)):
-            out.append(f"{rec['id']} ({rec.get('op', 'generate')} {rec.get('name', '')})")
+        if isinstance(rec, dict) and rid in sources_of(rec):
+            out.append(f"{d.name} ({rec.get('op') or 'generate'} {rec.get('name') or ''})".replace(" )", ")"))
     return out
 
 

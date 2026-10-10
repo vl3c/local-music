@@ -198,3 +198,15 @@ def test_speech_margin_finds_where_a_voice_is_buried():
     assert 5.5 <= a <= 6.5 and 8.5 <= b <= 9.5 and worst < 0
     quiet = post.speech_margin(voice, music * 0.01, SR)
     assert quiet["under"] == [] and quiet["p10_db"] > post.MARGIN_P10_WARN_DB
+
+
+
+def test_speech_margin_of_a_short_voice_in_a_long_mix():
+    n = 120 * SR
+    voice = np.zeros((2, n), np.float32)
+    t = np.arange(4 * SR) / SR
+    voice[:, 10 * SR:14 * SR] = 0.2 * np.sin(2 * np.pi * 1000 * t)  # 4 s of a 2-minute mix
+    rest = np.random.default_rng(0).standard_normal((2, n)).astype(np.float32) * 0.002
+    m = post.speech_margin(voice, rest, SR)
+    assert m["median_db"] > 20 and m["under"] == []  # judged where it speaks, not where it's silent
+    assert post.speech_margin(np.zeros((2, n), np.float32), rest, SR)["median_db"] is None
