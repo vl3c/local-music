@@ -1,0 +1,16 @@
+# What the test suite needs, for CI: no GPU, no model weights, no engine checkout, and no
+# torch (the server only imports it to report VRAM and free its cache, which the tests fake).
+# The same versions as the real install (requirements.txt).
+numpy==2.5.3
+scipy==1.18.1
+soundfile==0.14.0
+soxr==1.1.0
+pyloudnorm==0.2.0
+librosa==1.0.0
+matplotlib==3.11.2
+fastapi==0.142.2
+starlette==1.7.0
+uvicorn==0.54.0
+pydantic==2.13.5
+httpx==0.28.1
+pytest==9.1.1

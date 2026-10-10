@@ -1,0 +1,49 @@
+# This repo tracks ONLY first-party source: the server, the music package, scripts, docs.
+# Everything install.ps1 creates, every weight download_models.py fetches, and every
+# track you generate is ignored. After a fresh install `git status` must still be clean.
+
+# --- your music, settings and logs --------------------------------------------
+config.local.json
+logs/
+output/
+input/
+temp/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aif
+*.aiff
+*.m4a
+*.opus
+*.pcm
+*.png
+
+# --- everything install.ps1 creates -------------------------------------------
+engine/
+.venv/
+.venv-*/
+venv/
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+
+# --- python noise ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# --- secrets and local tool state -----------------------------------------------
+.env
+.env.*
+.claude/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

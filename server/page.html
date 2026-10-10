@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>local-music</title>
+<style>
+:root { --bg:#f5f5f2; --fg:#1b1b1b; --card:#fff; --muted:#666; --line:#dcdcd6; --acc:#2a62c9; --bad:#b3261e; --warn:#9a6700; --ok:#1e7a3c; --chip:#eef0f4; }
+@media (prefers-color-scheme: dark) { :root { --bg:#151618; --fg:#e7e7e7; --card:#202124; --muted:#9a9a9a; --line:#36383c; --acc:#6c9eff; --bad:#ff8a80; --warn:#e3b341; --ok:#5fd38a; --chip:#2b2d31; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+header { display:flex; gap:12px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); }
+header h1 { font-size:18px; margin:0; }
+#status { font-size:12px; color:var(--muted); } #status.ready { color:var(--ok); } #status.busy { color:var(--warn); } #status.down { color:var(--bad); }
+main { display:grid; grid-template-columns:360px 1fr; gap:16px; padding:16px; max-width:1500px; margin:0 auto; }
+@media (max-width:900px) { main { grid-template-columns:1fr; } }
+.panel, .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+.panel h2 { font-size:12px; margin:16px 0 6px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
+input, select, textarea, button { font:inherit; color:var(--fg); }
+input, select, textarea { width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); }
+textarea { resize:vertical; min-height:96px; }
+.row { display:grid; grid-template-columns:1fr 1fr; gap:8px; } .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+.check { display:flex; gap:6px; align-items:center; margin-top:8px; font-size:13px; color:var(--fg); }
+.check input { width:auto; }
+button, a.button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--bg); cursor:pointer; text-decoration:none; color:var(--fg); display:inline-block; font-size:14px; }
+button.primary { background:var(--acc); border-color:var(--acc); color:#fff; font-weight:600; }
+button.wide { width:100%; padding:10px 12px; margin-top:12px; }
+button.link { border:none; background:none; color:var(--bad); padding:0; font-size:12px; text-decoration:underline; }
+button:disabled { opacity:.5; cursor:wait; }
+.btns { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; align-items:center; }
+.preview { font-size:12px; color:var(--muted); margin-top:6px; min-height:1em; word-break:break-word; }
+details > summary { cursor:pointer; color:var(--muted); font-size:13px; user-select:none; }
+details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10px; }
+.takes { display:grid; grid-template-columns:repeat(auto-fill, minmax(420px, 1fr)); gap:12px; }
+@media (max-width:500px) { .takes { grid-template-columns:1fr; } }
+.card h3 { margin:0 0 6px; font-size:16px; display:flex; gap:8px; align-items:center; }
+.badge { font-size:11px; font-weight:600; border-radius:10px; padding:1px 8px; background:var(--acc); color:#fff; }
+.badge.bad { background:var(--bad); }
+.chips { display:flex; flex-wrap:wrap; gap:4px; margin:4px 0; }
+.chip { background:var(--chip); border-radius:12px; padding:1px 9px; font-size:12px; }
+.chip.bad { color:var(--bad); } .chip.ok { color:var(--ok); } .chip.mid { color:var(--warn); }
+.warn { color:var(--warn); font-size:12px; } .fail { color:var(--bad); font-size:12px; font-weight:600; } .note { color:var(--muted); font-size:12px; }
+.card audio { width:100%; margin-top:6px; height:40px; }
+.card img { width:100%; border-radius:6px; margin-top:6px; cursor:zoom-in; }
+.act { display:grid; grid-template-columns:auto 1fr auto; gap:6px; align-items:center; margin-top:6px; font-size:12px; }
+.act input { padding:4px 6px; font-size:12px; }
+.act button { padding:4px 10px; font-size:13px; }
+.reqhead { margin-bottom:12px; } .reqhead h2 { margin:0; font-size:18px; } .reqhead .sub { color:var(--muted); font-size:13px; word-break:break-word; }
+.history { font-size:13px; max-height:220px; overflow:auto; }
+.history div { padding:4px 0; cursor:pointer; border-bottom:1px dashed var(--line); display:flex; gap:6px; justify-content:space-between; }
+.history div:hover, .history div.cur { color:var(--acc); }
+.history .tag { font-size:10px; background:var(--chip); border-radius:8px; padding:0 6px; color:var(--muted); white-space:nowrap; }
+.small { font-size:12px; color:var(--muted); }
+#msg { margin:8px 0; font-size:13px; color:var(--bad); }
+.working { text-align:center; padding:40px 14px; color:var(--muted); }
+#big { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; align-items:center; justify-content:center; z-index:60; }
+#big img { max-width:96vw; max-height:94vh; } #big.on { display:flex; }
+</style>
+</head>
+<body>
+<header><h1>local-music</h1><span id="status">connecting...</span></header>
+<main>
+<section class="panel">
+  <label for="text">Music</label>
+  <textarea id="text" placeholder="Genre, instruments, mood, energy, era, production. e.g. A warm lo-fi hip hop beat with dusty piano chords, soft vinyl crackle and a laid-back boom bap groove" title="Describe the music like a library-music catalogue entry: genre, instruments and how they sound, mood and energy. Ctrl+Enter generates."></textarea>
+  <div class="row3">
+    <div><label for="duration">Seconds</label><input id="duration" type="number" min="2" max="380" step="1" title="2-380 s on Medium (2-120 on Small). Results are best when the length suits the music."></div>
+    <div><label for="bpm">BPM</label><input id="bpm" type="number" min="30" max="300" step="1" placeholder="any" title="Added to the prompt and checked in the result. Needed for loops."></div>
+    <div><label for="key">Key</label><input id="key" placeholder="any" title="e.g. A minor, F# major, Bbm. Added to the prompt and checked (the model follows it only loosely)."></div>
+  </div>
+  <div class="row">
+    <div><label for="kind">Kind</label><select id="kind" title="A full instrumental track, or one instrument / part (a drum loop, a solo piano)"><option value="music">full track</option><option value="stem">one instrument</option></select></div>
+    <div><label for="n">Takes</label><input id="n" type="number" min="1" max="8" title="Best-of-N: this many takes on consecutive seeds, checked and ranked"></div>
+  </div>
+  <div class="preview" id="preview"></div>
+  <button class="primary wide" id="go">Generate</button>
+  <div id="msg"></div>
+
+  <details class="adv" id="adv">
+    <summary>Mastering and fine-tuning</summary>
+    <div class="row">
+      <div><label for="lufs">Loudness (LUFS)</label><input id="lufs" type="number" min="-30" max="-6" step="0.5" title="-14 is streaming level; -16 to -18 sits under dialogue"></div>
+      <div><label for="peak_dbtp">Peak ceiling (dBTP)</label><input id="peak_dbtp" type="number" min="-12" max="0" step="0.1"></div>
+    </div>
+    <div class="row">
+      <div><label for="fade_in">Fade in (s)</label><input id="fade_in" type="number" min="0" max="30" step="0.5"></div>
+      <div><label for="fade_out">Fade out (s)</label><input id="fade_out" type="number" min="0" max="30" step="0.5"></div>
+    </div>
+    <div class="row">
+      <div><label for="loop_bars">Loop (bars)</label><input id="loop_bars" type="number" min="1" max="64" placeholder="no" title="Deliver a seamless loop of this many bars, cut on the beat (give a BPM)"></div>
+      <div><label for="beats_per_bar">Beats per bar</label><input id="beats_per_bar" type="number" min="1" max="12" placeholder="4"></div>
+    </div>
+    <div class="row">
+      <div><label for="seed">Seed</label><input id="seed" type="number" min="0" placeholder="random" title="Takes use seed, seed+1, ... Empty: random"></div>
+      <div><label for="engine">Engine</label><select id="engine"><option value="medium">Medium</option><option value="small">Small-Music</option></select></div>
+    </div>
+    <label class="check"><input type="checkbox" id="raw"> send the text as written (no tags, tempo or key)</label>
+    <label class="check"><input type="checkbox" id="check"> score takes (CLAP + Audiobox Aesthetics)</label>
+    <div class="btns">
+      <button id="save" title="Store these as your defaults (config.local.json) for the page and for every request that leaves them out">Save as my defaults</button>
+      <button id="reset" title="Delete config.local.json: back to the built-in defaults">Reset to built-in</button>
+    </div>
+  </details>
+
+  <h2>Recent</h2>
+  <div class="history" id="history"></div>
+</section>
+
+<section id="view"><div class="working small">Describe some music and press Generate (Ctrl+Enter).</div></section>
+</main>
+<div id="big"><img alt=""></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const FIELDS = ["duration", "n", "lufs", "peak_dbtp", "fade_in", "fade_out", "seed", "engine", "raw", "check"];
+let settings = null, current = null, busy = false;
+
+async function api(path, body, method) {
+  const opt = body === undefined ? {method: method || "GET"} : {method: method || "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  let data = null;
+  try { data = await r.json(); } catch (e) { /* no body */ }
+  if (!r.ok) {
+    let d = data && data.detail;
+    if (Array.isArray(d)) d = d.map(x => (x.loc || []).slice(1).join(".") + ": " + x.msg).join("; ");
+    throw new Error(d || r.statusText);
+  }
+  return data;
+}
+
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const c of kids) if (c != null) e.append(c);
+  return e;
+}
+
+function num(id) { const v = $(id).value.trim(); return v === "" ? null : Number(v); }
+
+function fill(eff) {
+  for (const k of FIELDS) {
+    const e = $(k); if (!e) continue;
+    if (e.type === "checkbox") e.checked = !!eff[k]; else e.value = eff[k] == null ? "" : eff[k];
+  }
+}
+
+async function loadSettings() { settings = await api("/api/settings"); fill(settings.effective); }
+
+function body() {
+  const b = {text: $("text").value, kind: $("kind").value, engine: $("engine").value, raw: $("raw").checked, check: $("check").checked};
+  for (const k of ["duration", "n", "bpm", "lufs", "peak_dbtp", "fade_in", "fade_out", "loop_bars", "beats_per_bar"]) { const v = num(k); if (v != null) b[k] = v; }
+  const key = $("key").value.trim(); if (key) b.key = key;
+  const seed = num("seed"); b.seed = seed;  // null: random
+  return b;
+}
+
+let pt = null;
+function preview() {
+  clearTimeout(pt);
+  pt = setTimeout(async () => {
+    const t = $("text").value.trim();
+    if (!t) { $("preview").textContent = ""; return; }
+    const q = new URLSearchParams({text: t, kind: $("kind").value, raw: $("raw").checked});
+    if (num("bpm")) q.set("bpm", num("bpm"));
+    if ($("key").value.trim()) q.set("key", $("key").value.trim());
+    try { const r = await api("/api/prompt?" + q); $("preview").textContent = "prompt: " + r.prompt; }
+    catch (e) { $("preview").textContent = e.message; }
+  }, 300);
+}
+
+function setBusy(b, what) {
+  busy = b;
+  $("go").disabled = b;
+  document.querySelectorAll(".card button, .reqhead button").forEach(x => x.disabled = b);
+  if (b) { $("view").replaceChildren(el("div", {class: "working", text: what + "... (the first one after a start loads the engine: ~40 s)"})); }
+}
+
+async function run(path, payload, what) {
+  if (busy) return;
+  $("msg").textContent = "";
+  setBusy(true, what);
+  try { show(await api(path, payload)); history(); }
+  catch (e) { $("msg").textContent = e.message; if (current) show(current); else $("view").replaceChildren(); }
+  finally { setBusy(false); }
+}
+
+function fmt(v, d) { return v == null ? "?" : Number(v).toFixed(d); }
+
+function chips(t) {
+  const c = el("div", {class: "chips"});
+  const a = t.aes || {};
+  const grade = (v, lo, hi) => v == null ? "" : v >= hi ? "ok" : v >= lo ? "mid" : "bad";
+  if (a.CE != null) c.append(el("span", {class: "chip " + grade(a.CE, 5.5, 7), title: "Audiobox content enjoyment (1-10)", text: "CE " + fmt(a.CE, 1)}));
+  if (a.PQ != null) c.append(el("span", {class: "chip " + grade(a.PQ, 6.5, 7.5), title: "Audiobox production quality (1-10)", text: "PQ " + fmt(a.PQ, 1)}));
+  if (t.clap != null) c.append(el("span", {class: "chip " + grade(t.clap, 0.25, 0.4), title: "CLAP prompt match (cosine)", text: "CLAP " + fmt(t.clap, 2)}));
+  const m = t.music || {}, tp = m.tempo || {}, k = m.key || {};
+  if (tp.bpm) c.append(el("span", {class: "chip " + (tp.match === "exact" || tp.match === "half" || tp.match === "double" ? "ok" : tp.match ? "mid" : ""), title: "measured tempo (beat-grid steadiness " + fmt(tp.confidence, 2) + ")", text: fmt(tp.bpm, 0) + " BPM"}));
+  if (k.key) c.append(el("span", {class: "chip " + (k.match === "exact" ? "ok" : k.match ? "mid" : ""), title: "estimated key (strength " + fmt(k.strength, 2) + "; runner-up " + k.runner_up + ")", text: k.key}));
+  const p = t.post || {};
+  if (p.length_s) c.append(el("span", {class: "chip", text: fmt(p.length_s, 1) + " s"}));
+  if (p.loop) c.append(el("span", {class: "chip " + (p.seam_ok ? "ok" : "bad"), title: "seamless loop: seam similarity " + p.loop.seam_similarity, text: "loop " + p.loop.bars + " bars"}));
+  if (t.final) c.append(el("span", {class: "chip", title: "delivered loudness / true peak", text: fmt(t.final.lufs, 1) + " LUFS"}));
+  return c;
+}
+
+function action(label, input, btn) { return el("div", {class: "act"}, el("span", {text: label}), input, btn); }
+
+function card(res, t) {
+  const f = t.files;
+  const top = t.rank === 1 && !t.rejected;
+  const c = el("div", {class: "card"},
+    el("h3", {}, el("span", {text: "#" + t.rank}), t.rejected ? el("span", {class: "badge bad", text: "rejected"}) : top ? el("span", {class: "badge", text: "best"}) : null,
+      el("span", {class: "small", text: "seed " + t.seed + "  ·  score " + fmt(t.rank_score, 2)})),
+    chips(t),
+    el("audio", {controls: "", preload: "none", src: "/files/" + f.mp3}),
+    el("img", {src: "/files/" + f.png + "?t=" + Date.now(), alt: "waveform, loudness and spectrogram", loading: "lazy", onclick: e => { $("big").firstChild.src = e.target.src; $("big").classList.add("on"); }}));
+  for (const x of t.fails || []) c.append(el("div", {class: "fail", text: x}));
+  for (const x of t.warnings || []) c.append(el("div", {class: "warn", text: x}));
+  const m = t.music || {};
+  for (const x of [(m.tempo || {}).note, (m.key || {}).note]) if (x) c.append(el("div", {class: "note", text: x}));
+  c.append(el("div", {class: "btns"},
+    el("a", {class: "button", href: "/files/" + f.wav, download: res.name + "_" + t.seed + ".wav", text: "WAV"}),
+    el("a", {class: "button", href: "/files/" + f.mp3, download: res.name + "_" + t.seed + ".mp3", text: "MP3"}),
+    el("span", {class: "small", text: t.ref})));
+  const secs = el("input", {type: "number", min: "2", max: "360", value: "30", title: "seconds of new music"});
+  const str = el("input", {type: "number", min: "0.05", max: "1", step: "0.05", value: "0.5", title: "0.1 close, 0.5 same style new notes, 1 unrelated"});
+  const span = el("input", {placeholder: "e.g. 20-28", title: "seconds: the span to regenerate"});
+  const txt = () => $("text").value.trim() && $("text").value.trim() !== res.text ? {text: $("text").value.trim()} : {};
+  c.append(
+    action("Extend by", secs, el("button", {text: "Extend", title: "Continue this take (uses the prompt box if you changed it)", onclick: () => run("/api/extend", {take: t.ref, seconds: Number(secs.value), ...txt()}, "Extending")})),
+    action("Variation", str, el("button", {text: "Vary", title: "Variations of this take: the engine starts from it", onclick: () => run("/api/vary", {take: t.ref, strength: Number(str.value), ...txt()}, "Making variations")})),
+    action("Redo span", span, el("button", {text: "Inpaint", title: "Regenerate this span, keep the rest", onclick: () => {
+      const m = /^\s*([\d.]+)\s*-\s*([\d.]+)\s*$/.exec(span.value);
+      if (!m) { $("msg").textContent = "span: START-END in seconds, e.g. 20-28"; return; }
+      run("/api/inpaint", {take: t.ref, start: Number(m[1]), end: Number(m[2]), ...txt()}, "Inpainting");
+    }})));
+  return c;
+}
+
+function show(res) {
+  current = res;
+  const what = (res.op || "generate") + (res.source ? " of " + res.source : "");
+  const loopBars = el("input", {type: "number", min: "1", max: "64", value: (res.post && res.post.loop_bars) || 4, style: "width:70px"});
+  const head = el("div", {class: "reqhead"},
+    el("h2", {text: res.name}),
+    el("div", {class: "sub", text: res.id + "  ·  " + what + "  ·  " + res.engine + "  ·  " + res.takes.length + " take(s), " + res.kept + " kept  ·  " + (res.gen_s != null ? res.gen_s + " s + " + res.score_s + " s checks" : "")}),
+    el("div", {class: "sub", text: res.prompt}),
+    el("div", {class: "btns"},
+      el("button", {text: "Re-master with panel settings", title: "Loudness, fades, loop and length from the panel; no regeneration", onclick: () => {
+        const b = {request: res.id}; for (const k of ["lufs", "peak_dbtp", "fade_in", "fade_out", "beats_per_bar"]) { const v = num(k); if (v != null) b[k] = v; }
+        b.loop_bars = num("loop_bars"); run("/api/master", b, "Re-mastering");
+      }}),
+      el("span", {class: "small", text: "loop"}), loopBars,
+      el("button", {text: "Make loops", title: "Cut every take into a seamless loop of this many bars", onclick: () => run("/api/master", {request: res.id, loop_bars: Number(loopBars.value)}, "Cutting loops")}),
+      res.post && res.post.loop_bars ? el("button", {text: "Whole tracks", onclick: () => run("/api/master", {request: res.id, loop_bars: null}, "Re-mastering")}) : null,
+      el("button", {class: "link", text: "delete", onclick: async () => {
+        if (!confirm("Delete every file of " + res.id + "?")) return;
+        await api("/api/requests/" + res.id, undefined, "DELETE"); current = null; $("view").replaceChildren(); history();
+      }})));
+  for (const w of res.warnings || []) head.append(el("div", {class: "warn", text: w}));
+  const grid = el("div", {class: "takes"});
+  for (const t of res.takes) grid.append(card(res, t));
+  $("view").replaceChildren(head, grid);
+  document.querySelectorAll(".history div").forEach(d => d.classList.toggle("cur", d.dataset.id === res.id));
+}
+
+async function history() {
+  try {
+    const list = await api("/api/requests?limit=40");
+    $("history").replaceChildren(...list.map(r => el("div", {"data-id": r.id, class: current && current.id === r.id ? "cur" : "", onclick: async () => { if (!busy) show(await api("/api/requests/" + r.id)); }},
+      el("span", {text: (r.name || r.id) + " "}), el("span", {class: "tag", text: (r.op || "generate") + " · " + Math.round(r.duration || 0) + " s"}))));
+  } catch (e) { /* the status line says why */ }
+}
+
+async function status() {
+  try {
+    const h = await api("/api/health");
+    const s = $("status");
+    const eng = Object.entries(h.engines).filter(([, v]) => v).map(([k]) => k).join(", ") || "engine not loaded";
+    s.textContent = (h.busy ? "busy" : "ready") + "  ·  " + eng + "  ·  VRAM " + h.vram_used_gb + "/" + h.vram_total_gb + " GB";
+    s.className = h.busy ? "busy" : "ready";
+  } catch (e) { $("status").textContent = "server not reachable"; $("status").className = "down"; }
+}
+
+$("go").addEventListener("click", () => {
+  if (!$("text").value.trim()) { $("msg").textContent = "Describe the music first."; return; }
+  run("/api/generate", body(), "Generating");
+});
+$("text").addEventListener("keydown", e => { if (e.key === "Enter" && e.ctrlKey) $("go").click(); });
+for (const id of ["text", "bpm", "key", "kind", "raw"]) $(id).addEventListener("input", preview);
+$("save").addEventListener("click", async () => {
+  if (!confirm("Save these settings as your defaults?")) return;
+  const b = {}; for (const k of FIELDS) { const e = $(k); b[k] = e.type === "checkbox" ? e.checked : (e.tagName === "SELECT" ? e.value : num(k)); }
+  try { settings = await api("/api/settings", b); fill(settings.effective); } catch (e) { $("msg").textContent = e.message; }
+});
+$("reset").addEventListener("click", async () => {
+  if (!confirm("Forget your saved defaults?")) return;
+  settings = await api("/api/settings", undefined, "DELETE"); fill(settings.effective);
+});
+$("big").addEventListener("click", () => $("big").classList.remove("on"));
+
+loadSettings().catch(() => {});
+history(); status(); setInterval(status, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+# The one venv (.venv): the server, the checks and the Stable Audio 3 worker. install.ps1
+# installs torch 2.7.1 + torchaudio from the CUDA wheel index first (the stable-audio-3
+# library pins torch==2.7.1; cu128 because RTX 50-series needs CUDA 12.8+), then the
+# library itself with --no-deps from engine/stable-audio-3, then this list; nothing here may
+# replace that torch. Versions are the ones this repo was tested with: a newer DSP library
+# can change how tracks are measured, looped and mastered.
+
+# stable-audio-3's own dependencies (its pyproject, minus torch)
+einops==0.8.2
+einops-exts==0.0.4
+numpy==2.5.3
+packaging==26.3
+safetensors==0.8.0
+tqdm==4.70.1
+huggingface_hub==1.33.0     # also scripts/download_models.py
+hf_xet==1.6.0               # faster Hub downloads
+transformers==5.18.0        # T5Gemma (the engine's text encoder) and CLAP
+soundfile==0.14.0
+
+# analysis, checks and mastering (the limiter is numpy/scipy; MP3s come from libsndfile via soundfile)
+scipy==1.18.1
+soxr==1.1.0                 # resampling (and 4x oversampling for true peak)
+pyloudnorm==0.2.0           # ITU-R BS.1770 loudness
+librosa==1.0.0              # tempo, beats and key
+matplotlib==3.11.2          # waveform + spectrogram PNGs for the review loop
+audiobox_aesthetics==0.0.4  # Meta Audiobox Aesthetics
+
+# the server
+fastapi==0.142.2
+starlette==1.7.0
+uvicorn==0.54.0
+pydantic==2.13.5
+
+# tests/
+pytest==9.1.1
+httpx==0.28.1               # FastAPI's test client

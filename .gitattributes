@@ -1,0 +1,13 @@
+# Normalize to LF in the repo; check out platform-appropriate line endings.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF or cmd.exe/PowerShell can misparse them.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Never treat these as text if one ever slips past .gitignore.
+*.safetensors binary
+*.png binary
+*.jpg binary
+*.webp binary

@@ -1,0 +1,140 @@
+{
+  "sa3-medium": {
+    "repo": "stabilityai/stable-audio-3-medium",
+    "revision": "d4d3579395a8ac0df4ab13b5b1d7138ce7290f81",
+    "files": [
+      {
+        "path": "LICENSE.md",
+        "bytes": 11852,
+        "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+      },
+      {
+        "path": "LICENSE_GEMMA.md",
+        "bytes": 10541,
+        "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+      },
+      {
+        "path": "NOTICE",
+        "bytes": 97,
+        "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 9222116660,
+        "sha256": "48d9c65e290e7bcd5194e0633bfc2424a59ee9683f5c2d58762d997b7d8ce0b5"
+      },
+      {
+        "path": "model_config.json",
+        "bytes": 10360,
+        "sha256": "4f8846649df59167e1792d134acb6fc2bb7105227c5455300bad6cb107e20c88"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/.gitattributes",
+        "bytes": 1570,
+        "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/README.md",
+        "bytes": 18296,
+        "sha256": "6a96748c87d323d6080d037191346e68c3eda39c34c0530cb4f7f3bd8cc20319"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/config.json",
+        "bytes": 2540,
+        "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/generation_config.json",
+        "bytes": 156,
+        "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/model.safetensors",
+        "bytes": 1183022944,
+        "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/special_tokens_map.json",
+        "bytes": 636,
+        "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/tokenizer.json",
+        "bytes": 34362429,
+        "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/tokenizer.model",
+        "bytes": 4241003,
+        "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+      },
+      {
+        "path": "t5gemma-b-b-ul2/tokenizer_config.json",
+        "bytes": 46437,
+        "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+      }
+    ]
+  },
+  "aesthetics": {
+    "repo": "facebook/audiobox-aesthetics",
+    "revision": "9b1dd8e5df9af7216e836a98974fe3b82c56ded6",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 492,
+        "sha256": "0b8eabc5ced92cefed116a3aca8f1e59d2a33dc4d376b9e86dfb9c072e1d280d"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 415472992,
+        "sha256": "a5a3c2412649cc2384ec525ffd5180ce6c4778f43bed6108e0a1303de04d014e"
+      }
+    ]
+  },
+  "clap": {
+    "repo": "laion/larger_clap_general",
+    "revision": "ada0c23a36c4e8582805bb38fec3905903f18b41",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 643,
+        "sha256": "6268f76a067e3104bf9001e97d7dcc0fcfb16f3086cfb478ee72d95900d7fc1d"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 456318,
+        "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 541,
+        "sha256": "9739f58296aa6f9ac18008fd0150fb2649bc554985fbde86d0a4041c882ac753"
+      },
+      {
+        "path": "pytorch_model.bin",
+        "bytes": 776444665,
+        "sha256": "314eb00cce6ad68d25237b8446b659ccdb136ed4672c1bca470f142f72455026"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 280,
+        "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 2108774,
+        "sha256": "dc239041d98de27ffc3975473a1a23e3db4c937b23c138c38bbc66588bd247e5"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 1362,
+        "sha256": "e2eb445cfdbf4711de620cbdf10478b0423950799e85652d9f28da47066ab86d"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 798293,
+        "sha256": "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e"
+      }
+    ]
+  }
+}

@@ -1,0 +1,401 @@
+"""Command-line front end for the local-music server (standard library only).
+
+The server must be running (start.cmd). Everything stays on 127.0.0.1.
+
+    python scripts/music.py "warm lo-fi hip hop, dusty piano, vinyl crackle" --bpm 84    # 3 takes, ranked
+    python scripts/music.py "epic orchestral trailer music" --duration 120 --out D:/game/music
+    python scripts/music.py "chiptune boss battle" --bpm 160 --loop-bars 8 --out D:/game/music
+    python scripts/music.py "solo nylon guitar, flamenco" --stem --key "E minor"
+    python scripts/music.py --extend 20261010-120000-ab12:1234 --seconds 60       # continue a take
+    python scripts/music.py --vary 20261010-120000-ab12:1234 --strength 0.3        # a variation
+    python scripts/music.py --inpaint 20261010-120000-ab12:1234 --span 20-28 "a drum fill"
+    python scripts/music.py --master 20261010-120000-ab12 --fade-out 4 --lufs -16  # re-master, no regeneration
+    python scripts/music.py --show-prompt "dark synthwave" --bpm 100
+
+A take is '<request id>:<seed>' (printed as `ref`). Delivered files are named after the
+request (warm-lofi-hip-hop_v01.wav, .mp3 and a .json sidecar) and never overwrite anything.
+
+Exit status: 0 done, 1 failed or no server, 2 bad arguments, 3 every take was rejected.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SERVER = "http://127.0.0.1:8192"
+# Never through a proxy: urllib honours HTTP_PROXY even for 127.0.0.1 unless NO_PROXY
+# says otherwise, which would hand the prompts to whatever the proxy is.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+OUTPUT = Path(__file__).resolve().parent.parent / "output"
+NAME = re.compile(r"^[A-Za-z0-9-]+$")
+SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def call(path: str, payload: dict | None = None, timeout: float = 3600, method: str | None = None):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(SERVER + path, data=data, headers={"Content-Type": "application/json"},
+                                 method=method)
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.load(exc).get("detail")
+        except Exception:
+            detail = exc.reason
+        if isinstance(detail, list):  # pydantic validation errors
+            detail = "; ".join(f"{'.'.join(str(x) for x in d.get('loc', [])[1:])}: {d.get('msg')}" for d in detail)
+        print(f"server said {exc.code}: {detail}", file=sys.stderr)
+        sys.exit(2 if exc.code in (400, 404, 422) else 1)
+    except (OSError, http.client.HTTPException) as exc:
+        # Refused, reset or timed out: the server is down, restarting or was stopped mid-request.
+        print(f"lost the server at {SERVER}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def wait_for_server(seconds: float) -> bool:
+    deadline = time.time() + seconds
+    while True:
+        try:
+            _OPENER.open(SERVER + "/api/health", timeout=5)
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(2)
+
+
+def play(path: Path) -> None:
+    """Play a WAV on this machine's default output device, blocking until it ends."""
+    if sys.platform == "win32":
+        import winsound
+        winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        return
+    players = [["afplay"]] if sys.platform == "darwin" else [
+        ["paplay"], ["aplay", "-q"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]]
+    for cmd in players:
+        if shutil.which(cmd[0]):
+            subprocess.run([*cmd, str(path)], check=True)
+            return
+    raise RuntimeError("no audio player found (tried " + ", ".join(c[0] for c in players) + ")")
+
+
+# --------------------------------------------------------------------------- delivery
+
+def _used_versions(out: Path, base: str) -> set[int]:
+    """Version numbers already taken in `out` for this base name (case-insensitive, like Windows)."""
+    rx = re.compile(re.escape(base) + r"_v(\d+)\.(wav|mp3|json|png)", re.I)
+    return {int(m.group(1)) for p in out.iterdir() if (m := rx.fullmatch(p.name))}
+
+
+def sidecar(res: dict, take: dict) -> dict:
+    keys = ("seed", "rank", "rank_score", "clap", "aes", "music", "fails", "warnings", "post", "final", "signal")
+    return {"request": res["id"], "ref": take.get("ref"), "op": res.get("op"), "source": res.get("source"),
+            "text": res.get("text"), "prompt": res.get("prompt"), "bpm": res.get("bpm"), "key": res.get("key"),
+            "engine": res.get("engine"), "model": res.get("model"), "steps": res.get("steps"),
+            **{k: take[k] for k in keys if k in take}}
+
+
+def deliver(res: dict, takes: list[dict], out: Path, fmt: str, png: bool, name: str | None = None) -> list[Path]:
+    """Copy takes to `out` as <name>_vNN.wav / .mp3 (+ .json sidecar, + .png with --png).
+
+    Never overwrites: numbering continues after whatever is there (compared case-insensitively),
+    and each file is created exclusively, so even a file appearing meanwhile isn't clobbered.
+    """
+    if name is not None and not NAME.fullmatch(name):
+        raise ValueError(f"--name takes letters, digits and hyphens only, not {name!r}")
+    out.mkdir(parents=True, exist_ok=True)
+    base = name or res["name"]
+    exts = {"all": ["wav", "mp3"], "wav": ["wav"], "mp3": ["mp3"]}[fmt]
+    used = _used_versions(out, base)
+    v = 1
+    while any((v + k) in used for k in range(len(takes))):
+        v += 1
+    paths = []
+    for t in takes:
+        while True:
+            stem = f"{base}_v{v:02d}"
+            try:
+                first = out / f"{stem}.{exts[0]}"
+                with open(first, "xb") as fh, open(OUTPUT / t["files"][exts[0]], "rb") as fs:
+                    shutil.copyfileobj(fs, fh)
+                break
+            except FileExistsError:
+                v += 1
+        paths.append(first)
+        for ext in exts[1:]:
+            shutil.copyfile(OUTPUT / t["files"][ext], out / f"{stem}.{ext}")
+            paths.append(out / f"{stem}.{ext}")
+        (out / f"{stem}.json").write_text(json.dumps(sidecar(res, t), indent=2, ensure_ascii=False),
+                                          encoding="utf-8")
+        if png:
+            shutil.copyfile(OUTPUT / t["files"]["png"], out / f"{stem}.png")
+            paths.append(out / f"{stem}.png")
+        v += 1
+    return paths
+
+
+# --------------------------------------------------------------------------- printing
+
+def describe(t: dict) -> str:
+    bits = [f"#{t.get('rank', '?')}", f"ref {t.get('ref')}", f"score {t.get('rank_score', 0):.2f}"]
+    aes = t.get("aes") or {}
+    if aes:
+        bits.append("  ".join(f"{k} {aes[k]:.1f}" for k in ("CE", "PQ") if k in aes))
+    if t.get("clap") is not None:
+        bits.append(f"CLAP {t['clap']:.2f}")
+    mus = t.get("music", {})
+    tempo, key = mus.get("tempo", {}), mus.get("key", {})
+    if tempo.get("bpm"):
+        bits.append(f"{tempo['bpm']:.0f} BPM" + (f" ({tempo['match']})" if tempo.get("match") else ""))
+    if key.get("key"):
+        bits.append(key["key"] + (f" ({key['match']})" if key.get("match") else ""))
+    p = t.get("post", {})
+    if "length_s" in p:
+        bits.append(f"{p['length_s']:.1f}s")
+    if "loop" in p:
+        lp = p["loop"]
+        bits.append(f"loop {lp['bars']} bars @ {lp['bpm']:g} BPM from {lp['start_s']:.1f}s, seam "
+                    + ("ok" if p.get("seam_ok") else "CHECK"))
+    line = "  ".join(bits)
+    if t.get("rejected"):
+        line += "  REJECTED: " + "; ".join(t["fails"])
+    for w in t.get("warnings", []):
+        line += f"\n      warning: {w}"
+    for note in (tempo.get("note"), key.get("note")):
+        if note:
+            line += f"\n      note: {note}"
+    return line
+
+
+def print_request(res: dict) -> None:
+    what = res.get("op", "generate") + (f" of {res['source']}" if res.get("source") else "")
+    print(f"request {res['id']}  {what}  {res.get('engine')}  {res.get('name')}")
+    if res.get("prompt"):
+        print(f"prompt:   {res['prompt']}")
+    if "negative" in res.get("ignored", []):
+        print("negative: ignored (the post-trained Stable Audio 3 models don't use it)")
+    if "gen_s" in res:
+        print(f"{len(res['takes'])} take(s) of {res.get('gen_length_s', 0):g} s in {res['gen_s']}s "
+              f"+ {res.get('score_s', 0)}s checks; {res['kept']} kept")
+    for t in res["takes"]:
+        print("  " + describe(t))
+        print(f"      {t['paths']['wav']}")
+        print(f"      {t['paths']['png']}")
+    for w in res.get("warnings", []):
+        print(f"WARNING: {w}")
+
+
+# --------------------------------------------------------------------------- main
+
+def given(d: dict) -> dict:
+    """Drop options left unset, so the server's (or the user's saved) defaults apply."""
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def master_fields(a) -> dict:
+    out = given({"length": a.length, "fade_in": a.fade_in, "fade_out": a.fade_out, "lufs": a.lufs,
+                 "peak_dbtp": a.peak, "loop_bars": a.loop_bars, "beats_per_bar": a.beats_per_bar})
+    if a.no_loop:
+        out["loop_bars"] = None  # an explicit null clears it on the server
+    if a.full_length:
+        out["length"] = None
+    return out
+
+
+def shape_fields(a) -> dict:
+    out = given({"n": a.n, "engine": a.engine, "steps": a.steps, "check": a.check})
+    if a.seeds:
+        out["seeds"] = [int(s) for s in a.seeds.split(",") if s.strip()]
+    elif a.seed is not None:
+        out["seed"] = None if a.seed.lower() == "random" else int(a.seed)
+    return out
+
+
+def main() -> int:
+    if not sys.stdout.isatty():  # piped (as agents run it): Windows would default to cp1252
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("text", nargs="?", help="the music: genre, instruments, mood, energy, era, production "
+                    "(with --extend / --vary / --inpaint: a new prompt for that part; default the source's)")
+    g = ap.add_argument_group("generation")
+    g.add_argument("--duration", type=float, help="seconds, 2-380 on medium, 2-120 on small (default 30)")
+    g.add_argument("--bpm", type=float, help="tempo: added to the prompt and checked in the result")
+    g.add_argument("--key", help="key, e.g. 'A minor', 'F# major', 'Bbm': added to the prompt and checked")
+    g.add_argument("--stem", action="store_true", help="one instrument or part (a drum loop, a solo piano), "
+                   "not a full arrangement")
+    g.add_argument("--n", type=int, help="takes to make and rank (best-of-N; default 3)")
+    g.add_argument("--seed", help="start seed (takes use seed, seed+1, ...), or 'random' (the default)")
+    g.add_argument("--seeds", help="exact seeds, comma-separated (e.g. to remake one take: --seeds 1234)")
+    g.add_argument("--engine", choices=["medium", "small"], help="medium (Stable Audio 3 Medium, the default) or "
+                   "small (Small-Music: lighter, lower quality, max 120 s; install with -WithSmall)")
+    g.add_argument("--raw", action="store_true", default=None, help="send the text as written: no tags, "
+                   "tempo or key added")
+    g.add_argument("--negative", help="negative prompt (ignored by the post-trained models; kept for -base ones)")
+    g.add_argument("--steps", type=int, help="sampling steps (default 8; more doesn't help the post-trained models)")
+    g.add_argument("--check", dest="check", action="store_true", default=None,
+                   help="CLAP + Audiobox Aesthetics scores (default on)")
+    g.add_argument("--no-check", dest="check", action="store_false", help="skip the model scores (the signal, "
+                   "tempo and key checks still run)")
+    s = ap.add_argument_group("from an earlier take (REF is REQ:SEED)")
+    s.add_argument("--extend", metavar="REF", help="continue the take: the result is the whole track, longer")
+    s.add_argument("--seconds", type=float, help="with --extend: how much new music (default 30)")
+    s.add_argument("--vary", metavar="REF", help="a variation of the take (audio to audio)")
+    s.add_argument("--strength", type=float, help="with --vary: 0.05 (nearly the same) .. 1 (unrelated); default 0.5")
+    s.add_argument("--inpaint", metavar="REF", help="regenerate a span of the take, keep the rest")
+    s.add_argument("--span", help="with --inpaint: START-END in seconds, e.g. 20-28")
+    m = ap.add_argument_group("mastering (also with --master REQ)")
+    m.add_argument("--length", type=float, help="cut the delivered track to this many seconds (with a fade)")
+    m.add_argument("--full-length", action="store_true", help="with --master: undo an earlier --length")
+    m.add_argument("--fade-in", type=float, help="seconds (default 0)")
+    m.add_argument("--fade-out", type=float, help="seconds (default 0; a take that ends abruptly warns)")
+    m.add_argument("--lufs", type=float, help="loudness target (default -14, streaming level; -16..-18 for "
+                   "background music under dialogue)")
+    m.add_argument("--peak", type=float, help="true-peak ceiling in dBTP (default -1)")
+    m.add_argument("--loop-bars", type=int, help="deliver a seamless loop of this many bars, cut on the beat "
+                   "(give --bpm when generating, so the take is long enough)")
+    m.add_argument("--beats-per-bar", type=int, help="for loops and the plot's grid (default 4)")
+    m.add_argument("--no-loop", action="store_true", help="with --master: back to the whole track")
+    o = ap.add_argument_group("other actions")
+    o.add_argument("--master", metavar="REQ", help="re-master a request's takes with the options above; no regeneration")
+    o.add_argument("--show-prompt", action="store_true", help="print the prompt the engine would get, and exit")
+    o.add_argument("--list", action="store_true", help="recent requests")
+    o.add_argument("--settings", action="store_true", help="show the defaults in effect")
+    o.add_argument("--engines", action="store_true", help="engines: installed / running")
+    o.add_argument("--delete", metavar="REQ", help="delete a request's files from output/")
+    d = ap.add_argument_group("delivery")
+    d.add_argument("--out", type=Path, help="copy results here as <name>_vNN.wav/.mp3 + .json (never overwrites)")
+    d.add_argument("--format", choices=["all", "wav", "mp3"], default="all", help="with --out: all (WAV + MP3, "
+                   "the default), wav or mp3")
+    d.add_argument("--best", type=int, default=1, help="with --out: how many of the best kept takes (default 1)")
+    d.add_argument("--all", action="store_true", help="with --out: every kept take")
+    d.add_argument("--png", action="store_true", help="with --out: copy the waveform/spectrogram PNGs too")
+    d.add_argument("--name", help="file name for delivered files (letters, digits, hyphens; default from the text)")
+    d.add_argument("--play", action="store_true", help="play the best take on this machine's speakers")
+    d.add_argument("--no-save", action="store_true", help="delete the request from output/ when done (after --out/--play)")
+    d.add_argument("--json", action="store_true", help="print only JSON (the server's response plus `delivered`)")
+    d.add_argument("--wait", type=float, default=5, help="seconds to wait for the server to come up")
+    a = ap.parse_args()
+
+    if a.seed is not None and a.seed.lower() != "random" and not a.seed.isdigit():
+        ap.error("--seed takes a number or 'random'")
+    sources = [x for x in (a.extend, a.vary, a.inpaint) if x]
+    if len(sources) > 1:
+        ap.error("use one of --extend, --vary, --inpaint at a time")
+    if not (a.text or sources or a.master or a.list or a.settings or a.engines or a.delete):
+        ap.error("give the music to make, or --extend / --vary / --inpaint REF, --master REQ, --list, "
+                 "--settings, --engines or --delete")
+    if a.inpaint and not a.span:
+        ap.error("--inpaint needs --span START-END (seconds)")
+    span = None
+    if a.span:
+        if not (mm := SPAN.fullmatch(a.span)):
+            ap.error("--span takes START-END in seconds, e.g. 20-28")
+        span = (float(mm.group(1)), float(mm.group(2)))
+    if a.name is not None and not NAME.fullmatch(a.name):
+        ap.error("--name takes letters, digits and hyphens only")
+    if not wait_for_server(a.wait):
+        print(f"No server at {SERVER}. Start it with start.cmd (agents: start.cmd --no-browser).", file=sys.stderr)
+        return 1
+
+    if a.settings:
+        st = call("/api/settings")
+        print("in effect: " + (f"your saved defaults ({st['file']}) over the built-in ones" if st["file"]
+                               else "the built-in defaults"))
+        for k, v in st["effective"].items():
+            shown = "random" if (k == "seed" and v is None) else "engine default" if (v is None) else v
+            print(f"  {k:10s} {shown}{'  (saved)' if k in st['saved'] else ''}")
+        return 0
+    if a.engines:
+        for k, e in call("/api/engines").items():
+            print(f"{k:7s} {e['label']:28s} {'installed' if e['installed'] else 'NOT installed'}"
+                  f"{', running' if e['running'] else ''}")
+        return 0
+    if a.list:
+        for r in call("/api/requests?limit=30"):
+            print(f"{r['id']}  {r.get('op') or 'generate':8s} {r.get('duration') or 0:6.1f}s  {r['takes']} take(s)  "
+                  f"{r.get('name')}: {(r.get('text') or '')[:60]}")
+        return 0
+    if a.delete:
+        r = call(f"/api/requests/{a.delete}", method="DELETE")
+        print(f"deleted request {r['id']} ({r['deleted']} files)")
+        return 0
+    if a.show_prompt and a.text:
+        q = urllib.parse.urlencode(given({"text": a.text, "bpm": a.bpm, "key": a.key,
+                                          "kind": "stem" if a.stem else "music", "raw": "true" if a.raw else None}))
+        r = call(f"/api/prompt?{q}")
+        print(json.dumps(r, indent=2) if a.json else f"prompt: {r['prompt']}\nfile:   {r['name']}_v01.wav")
+        return 0
+
+    text = {"text": a.text} if a.text else {}
+    if a.master:
+        res = call("/api/master", {"request": a.master, **master_fields(a), **given({"bpm": a.bpm, "check": a.check})})
+    elif a.extend:
+        res = call("/api/extend", {"take": a.extend, **text, **shape_fields(a), **master_fields(a),
+                                   **given({"seconds": a.seconds, "raw": a.raw})})
+    elif a.vary:
+        res = call("/api/vary", {"take": a.vary, **text, **shape_fields(a), **master_fields(a),
+                                 **given({"strength": a.strength, "raw": a.raw})})
+    elif a.inpaint:
+        res = call("/api/inpaint", {"take": a.inpaint, **text, "start": span[0], "end": span[1],
+                                    **shape_fields(a), **master_fields(a), **given({"raw": a.raw})})
+    else:
+        res = call("/api/generate", {"text": a.text, "kind": "stem" if a.stem else "music", **shape_fields(a),
+                                     **master_fields(a), **given({"duration": a.duration, "bpm": a.bpm, "key": a.key,
+                                                                  "raw": a.raw, "negative": a.negative,
+                                                                  "name": a.name})})
+
+    kept = [t for t in res["takes"] if not t.get("rejected")]
+    delivered: list[Path] = []
+    if a.out:
+        pick = kept if a.all else kept[:max(1, a.best)]
+        try:
+            delivered = deliver(res, pick, a.out, a.format, png=a.png, name=a.name)
+        except ValueError as exc:
+            ap.error(str(exc))
+
+    if a.json:
+        print(json.dumps({**res, "delivered": [str(p) for p in delivered]}, indent=2, ensure_ascii=False))
+    else:
+        print_request(res)
+        if delivered:
+            print("delivered:")
+            for p in delivered:
+                print(f"  {p}")
+
+    status = 0 if kept else 3
+    try:
+        if a.play:
+            target = next((p for p in delivered if p.suffix == ".wav"), None) or \
+                OUTPUT / (kept[0] if kept else res["takes"][0])["files"]["wav"]
+            try:
+                sys.stdout.flush()
+                play(target)
+                if not a.json:
+                    print(f"played {target.name}")
+            except Exception as exc:  # the take exists; only the playback failed
+                print(f"could not play {target}: {exc}", file=sys.stderr)
+                status = 1
+    finally:
+        if a.no_save and res.get("id") and not a.master:
+            call(f"/api/requests/{res['id']}", method="DELETE")
+            if not a.json:
+                print(f"not saved: removed request {res['id']} from output/")
+    if status == 3 and not a.json:
+        print("every take was rejected: try other seeds, or rephrase the prompt", file=sys.stderr)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

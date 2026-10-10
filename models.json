@@ -1,0 +1,69 @@
+{
+  "_comment": [
+    "Weight manifest. Each repo is pinned to a Hugging Face revision; scripts/download_models.py",
+    "fetches only the files listed in `files` (glob patterns) into models/<name> (gitignored), and",
+    "models.lock.json pins every file's size and SHA256. Weights are NOT redistributed by this repo:",
+    "see LICENSE-MODELS.md."
+  ],
+  "repos": [
+    {
+      "name": "sa3-medium",
+      "repo": "stabilityai/stable-audio-3-medium",
+      "revision": "d4d3579395a8ac0df4ab13b5b1d7138ce7290f81",
+      "role": "engine: Stable Audio 3 Medium (44.1 kHz stereo, up to 380 s, 8 steps)",
+      "licence": "Stability AI Community License (+ Gemma Terms for T5Gemma)",
+      "gated": true,
+      "gb": 10.44,
+      "files": [
+        "model.safetensors",
+        "model_config.json",
+        "t5gemma-b-b-ul2/*",
+        "LICENSE.md",
+        "LICENSE_GEMMA.md",
+        "NOTICE"
+      ]
+    },
+    {
+      "name": "sa3-small-music",
+      "repo": "stabilityai/stable-audio-3-small-music",
+      "revision": "8bdfb53c6b0fbc62113cd571fd37373efe15fa14",
+      "role": "optional engine: Stable Audio 3 Small-Music (44.1 kHz stereo, up to 120 s; shares Medium's text encoder)",
+      "licence": "Stability AI Community License (+ Gemma Terms for T5Gemma)",
+      "gated": true,
+      "optional": true,
+      "gb": 2.27,
+      "files": [
+        "model.safetensors",
+        "model_config.json",
+        "LICENSE.md",
+        "LICENSE_GEMMA.md",
+        "NOTICE"
+      ]
+    },
+    {
+      "name": "clap",
+      "repo": "laion/larger_clap_general",
+      "revision": "ada0c23a36c4e8582805bb38fec3905903f18b41",
+      "role": "check: CLAP text-audio similarity (music, speech and sounds; larger_clap_music's text tower is broken: every text embeds the same)",
+      "licence": "Apache-2.0",
+      "gb": 0.78,
+      "files": [
+        "*.json",
+        "*.txt",
+        "pytorch_model.bin"
+      ]
+    },
+    {
+      "name": "aesthetics",
+      "repo": "facebook/audiobox-aesthetics",
+      "revision": "9b1dd8e5df9af7216e836a98974fe3b82c56ded6",
+      "role": "check: Meta Audiobox Aesthetics (enjoyment, usefulness, complexity, production quality)",
+      "licence": "CC-BY-4.0",
+      "gb": 0.42,
+      "files": [
+        "config.json",
+        "model.safetensors"
+      ]
+    }
+  ]
+}
