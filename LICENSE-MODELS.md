@@ -1,12 +1,15 @@
 # Model licences
 
+**Powered by Stability AI.** (The Stability AI Community License asks products and services
+built on its models to say so prominently.)
+
 This repo's own code is MIT (see `LICENSE`). It does **not** include or redistribute any
 model weights or third-party code: `install.ps1` fetches them from their upstream sources,
 and they stay under their own licences. Check them yourself before any commercial use.
 
 | Component | Source | Licence | What it means here |
 |---|---|---|---|
-| Stable Audio 3 Medium weights | [stabilityai/stable-audio-3-medium](https://huggingface.co/stabilityai/stable-audio-3-medium) (gated) | [Stability AI Community License](https://stability.ai/license) (copy in `models/sa3-medium/LICENSE.md` after install) | Free for non-commercial use, and for commercial use by individuals and organisations under the revenue threshold the licence sets (US$1M a year; registration required); above it, an Enterprise licence. Not OSI open source. You accept it on Hugging Face before downloading. You own the music you generate ("Ownership of Outputs"), to the extent the law allows. |
+| Stable Audio 3 Medium weights | [stabilityai/stable-audio-3-medium](https://huggingface.co/stabilityai/stable-audio-3-medium) (gated) | [Stability AI Community License](https://stability.ai/license) (copy in `models/sa3-medium/LICENSE.md` after install) | Free for non-commercial use, and for commercial use by individuals and organisations under the revenue threshold the licence sets (US$1M a year; registration required); above it, an Enterprise licence. Not OSI open source. You accept it on Hugging Face before downloading. You own the music you generate ("Ownership of Outputs"), to the extent the law allows. Use must follow Stability's [Acceptable Use Policy](https://stability.ai/use-policy), and neither the model nor its outputs may be used to train other foundation models. |
 | Stable Audio 3 Small-Music weights (optional) | [stabilityai/stable-audio-3-small-music](https://huggingface.co/stabilityai/stable-audio-3-small-music) (gated) | Stability AI Community License | Same terms. Only downloaded with `-WithSmall`. |
 | T5Gemma text encoder (bundled with Stable Audio 3) | Google | [Gemma Terms of Use](https://ai.google.dev/gemma/terms) (`models/sa3-medium/LICENSE_GEMMA.md`) | Covers the encoder inside the Stable Audio 3 download. |
 | stable-audio-3 inference code | [Stability-AI/stable-audio-3](https://github.com/Stability-AI/stable-audio-3) (cloned into `engine/`) | MIT | |

@@ -76,6 +76,9 @@ def call(path: str, payload: dict | None = None, timeout: float = 3600, method: 
 def upload(path: Path, text: str | None = None, name: str | None = None, check: bool | None = None,
            kind: str | None = None) -> dict:
     """POST an audio file's bytes to /api/import: it comes back as a request with one take (seed 0)."""
+    if path.stat().st_size > 300 * 2**20:  # the server's limit: say so instead of a cut connection
+        print(f"{path.name} is over 300 MB: the server takes up to 300 MB (and 20 minutes)", file=sys.stderr)
+        sys.exit(2)
     q = urllib.parse.urlencode(given({"filename": path.name, "text": text, "name": name, "kind": kind,
                                       "check": None if check is None else str(check).lower()}))
     req = urllib.request.Request(f"{SERVER}/api/import?{q}", data=path.read_bytes(),

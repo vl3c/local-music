@@ -436,8 +436,10 @@ def test_extend_keeps_the_source_in_front(client, server, monkeypatch):
 def test_arrange_keeps_the_parts_and_writes_only_the_joins(client, server, monkeypatch):
     a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
     b = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
-    xa, _ = raw_of(server, a)
-    xb, _ = raw_of(server, b)
+    xa, ta = raw_of(server, a)
+    xb, tb = raw_of(server, b)
+    xa = xa * 10 ** (ta["post"]["gain_db"] / 20)  # each part joins at its delivered loudness
+    xb = xb * 10 ** (tb["post"]["gain_db"] / 20)
     noisy_engine(server, monkeypatch)
     res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20},
                                                      {"take": b, "start": 0, "end": 20}],
@@ -446,9 +448,9 @@ def test_arrange_keeps_the_parts_and_writes_only_the_joins(client, server, monke
     xf = int(0.1 * SR)
     assert y.shape[1] == 42 * SR
     cut = 19 * SR - xf  # part a is itself up to its blend (1 s before its end) minus the crossfade
-    assert np.array_equal(y[:, :cut], xa[:, :cut])
+    assert np.allclose(y[:, :cut], xa[:, :cut], atol=1e-6)
     tail = 42 * SR - (23 * SR + xf)  # part b is itself from 1 s past the bridge (+ crossfade)
-    assert np.array_equal(y[:, -tail:], xb[:, -tail:])
+    assert np.allclose(y[:, -tail:], xb[:, -tail:], atol=1e-6)
     assert not np.allclose(y[:, 20 * SR:22 * SR], 0)  # the bridge is the engine's
 
 
@@ -502,3 +504,36 @@ def test_a_mix_span_too_short_is_400(client):
     a = gen(client, n=1, duration=10)["takes"][0]["ref"]
     r = client.post("/api/mix", json={"layers": [{"take": a}, {"take": a, "start": 1.0, "end": 1.00001}]})
     assert r.status_code == 400
+
+
+def test_arrange_joins_parts_at_their_delivered_loudness(client, server):
+    from music import analysis
+    a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    quiet = band(110, 20.0, sr=48000) * 0.01  # about -40 dB under the generated part
+    q = client.post("/api/import", params={"filename": "quiet.wav"}, content=wav_bytes(quiet, 48000)).json()
+    res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20},
+                                                     {"take": q["takes"][0]["ref"], "start": 0, "end": 20}],
+                                           "bridge": 2, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    first = analysis.lufs(y[:, 2 * SR:16 * SR], SR)
+    second = analysis.lufs(y[:, 26 * SR:40 * SR], SR)
+    assert abs(first - second) < 3.0  # was ~30 dB apart before
+
+
+def test_extend_continues_from_the_music_not_its_trailing_silence(client, server):
+    x = np.concatenate([band(100, 12.0, sr=48000), np.zeros((2, 6 * 48000), np.float32)], axis=1)
+    imp = client.post("/api/import", params={"filename": "ends-early.wav"}, content=wav_bytes(x, 48000)).json()
+    res = client.post("/api/extend", json={"take": imp["takes"][0]["ref"], "seconds": 10, "n": 1}).json()
+    job = server._fake.jobs[-1]
+    assert job["mask_start"] < 12.5  # the silence isn't part of what it continues
+    assert any("left out" in w for w in res.get("warnings", []))
+    assert res["takes"][0]["signal"]["duration_s"] < 23.0
+
+
+def test_arrange_records_spans_as_the_take_plays(client):
+    x = np.concatenate([np.zeros((2, 3 * 48000), np.float32), band(100, 20.0, sr=48000)], axis=1)
+    imp = client.post("/api/import", params={"filename": "late.wav"}, content=wav_bytes(x, 48000)).json()
+    a = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    res = client.post("/api/arrange", json={"parts": [{"take": imp["takes"][0]["ref"], "start": 2, "end": 14},
+                                                     {"take": a}], "n": 1}).json()
+    assert (res["parts"][0]["start"], res["parts"][0]["end"]) == (pytest.approx(2.0, abs=0.01), pytest.approx(14.0, abs=0.01))

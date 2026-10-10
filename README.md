@@ -1,5 +1,7 @@
 # local-music
 
+**Powered by Stability AI** (Stable Audio 3).
+
 A private, fully local **instrumental music generator**, built for AI agents (and people) to
 call. Describe the music (genre, instruments, mood, tempo, key) and get back mastered
 tracks: checked, scored and ranked best-of-N, as 48 kHz WAVs and MP3s, with a waveform,
@@ -21,9 +23,10 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptModelLicenses   # 
 
 > **Licences, plainly.** This repo's code is MIT. Stable Audio 3 is under the **Stability AI
 > Community License**: free for non-commercial use and for commercial use by individuals and
-> organisations under US$1M a year in revenue (register with Stability first); you own what you
-> generate. It is gated on Hugging Face: accept it there and run `hf auth login` before
-> installing. `-AcceptModelLicenses` says you've read [LICENSE-MODELS.md](LICENSE-MODELS.md).
+> organisations under US$1M a year in revenue (register with Stability first). As between you and
+> Stability, you own what you generate, to the extent the law allows; its Acceptable Use Policy
+> applies, and you may not use the model or its outputs to train other foundation models. It is
+> gated on Hugging Face: accept it there and run `hf auth login` before installing. `-AcceptModelLicenses` says you've read [LICENSE-MODELS.md](LICENSE-MODELS.md).
 > Windows and an NVIDIA GPU are required.
 
 ## For AI agents (Claude Code skill)
@@ -87,7 +90,9 @@ python scripts\music.py "a drum fill and a riser" --combine <intro ref> <main re
 | **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span (seconds as the take plays), joins it musically | the whole track, the rest exactly as it was |
 
 A new text replaces the prompt for that part (default: the source's). Extending past the
-engine's 380 s window works too: it hears the last part of the track.
+engine's 380 s window works too: it hears the last part of the track. A fade-out or silence at
+the end of the source is left out first (with a warning): given those, the engine would
+continue the silence.
 
 **Only the new part is the engine's.** The engine re-renders everything it hears, not just
 what it was asked to write: the same music, but not the same waveform (measured 14-23 dB apart),
@@ -131,7 +136,8 @@ order. At each join the engine hears up to 20 s of the part before and after, wr
 seconds of new music between them (default 2 bars at the first part's tempo, 4 s without one;
 0 blends the parts straight into each other) and rewrites `--blend` seconds (default 1) of each
 part beside it so they flow into it. Everything else is the parts' own audio, sample for
-sample. The text describes the bridges
+sample, each brought to its delivered loudness first (an imported recording joins as loud as it
+plays on its own). The text describes the bridges
 ("a big drum fill and a rising synth sweep"; default: the first part's prompt).
 
 - A part can be a span of a take: `REF@20-60` (seconds as the take plays, as on its picture;

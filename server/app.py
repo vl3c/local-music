@@ -535,8 +535,10 @@ def draw(rec: dict, take: dict, opts: post.PostOpts, y: np.ndarray) -> None:
 
 def render_all(rec: dict, opts: post.PostOpts, prepare=None) -> list[np.ndarray]:
     """Master every take of a request in parallel and only then write anything, so one take
-    failing (a loop longer than it, say) leaves every take as it was; then the MP3s and the
-    plots. prepare(take), if given, runs first in the take's thread (a new take's analysis)."""
+    failing to master (a loop longer than it, say) leaves every take as it was; then the MP3s
+    and the plots. (A file locked while they're written, the browser playing it, still stops
+    part-way: a 409, some takes rewritten; running it again finishes the job.) prepare(take),
+    if given, runs first in the take's thread (a new take's analysis)."""
     def one(t):
         if prepare is not None:
             prepare(t)
@@ -784,6 +786,14 @@ def extend(req: ExtendReq):
     the new music, crossfaded over 0.1 s where they meet."""
     opt, src, raw_path, common = _from_take(req, "extend")
     x, sr = audio.read(raw_path)
+    # Continue from the music's body: given a fade-out or silence to continue, the engine
+    # continues it (a silent extension), and the gap would stay inside the result.
+    end = analysis.body(x, sr)[1]
+    trimmed = x.shape[1] - end
+    if trimmed > int(0.5 * sr):
+        x = x[:, :end]
+    else:
+        trimmed = 0
     src_s = x.shape[1] / sr
     with _lock:
         engine = opt["engine"] or src["engine"]
@@ -796,6 +806,9 @@ def extend(req: ExtendReq):
         rec = _new_record("extend", opt, info, engine, seeds, seconds=req.seconds,
                           duration=round(src_s + req.seconds, 2), gen_length_s=round(context_s + req.seconds, 2),
                           **common)
+        if trimmed:
+            rec["warnings"] = [f"the source's last {trimmed / sr:.1f} s (a fade-out or silence) were left out: "
+                               "the new music continues from where the source was still playing"]
         d = req_dir(rec["id"])
         # The engine hears the last context_s of the source (all of it, if it fits) and writes
         # what follows. It re-renders what it heard, too: the source is put back in front.
@@ -915,7 +928,16 @@ def _import(data: bytes, filename: str, text: str | None, kind: str, name: str |
             keep = int(MAX_IMPORT_S * sr)
             if f.frames > keep:  # decode only what's kept: a long FLAC is gigabytes as float
                 warnings.append(f"only the first {MAX_IMPORT_S / 60:.0f} minutes were imported")
-            x = f.read(min(f.frames, keep) if f.frames > 0 else keep, dtype="float32", always_2d=True)
+            # In blocks, two channels kept: an 8-channel 384 kHz file mustn't decode whole first.
+            blocks, got = [], 0
+            want = min(f.frames, keep) if f.frames > 0 else keep
+            while got < want:
+                blk = f.read(min(10 * sr, want - got), dtype="float32", always_2d=True)
+                if not len(blk):
+                    break
+                blocks.append(blk[:, :2].copy())
+                got += len(blk)
+            x = np.concatenate(blocks) if blocks else np.zeros((0, 1), np.float32)
     except Exception as exc:
         raise HTTPException(400, f"can't read {base!r} as audio ({exc}). WAV, FLAC, OGG and MP3 work; "
                                  "convert other formats (M4A, AAC...) first") from exc
@@ -1011,14 +1033,27 @@ def arrange(req: ArrangeReq):
         # At a join the engine must hear music, not a fade-out and silence (given those, it
         # writes a silent bridge): an inner edge starts or ends with the part's body, unless the
         # span sets it. The song's very start and end stay as they are.
-        b0, b1 = analysis.body(x, sr)
-        off = _raw_offset(src, take, item.take) if (item.start is not None or item.end is not None) else 0.0
-        a = item.start + off if item.start is not None else (b0 / sr if i > 0 else 0.0)
-        b = min(item.end + off, total) if item.end is not None else (b1 / sr if i < last else total)
+        tp = take.get("post", {})
+        looped = tp.get("loop") is not None
+        off = 0.0 if looped else float(tp.get("trim_start_s", 0.0))
+        if item.start is not None or item.end is not None:
+            off = _raw_offset(src, take, item.take)
+        # What the take delivers (a loop: its whole raw), on the raw timeline.
+        lo = 0.0 if looped else off
+        hi = total if looped else (off + tp["cut_at_s"] if tp.get("cut_at_s") else total - tp.get("trim_end_s", 0.0))
+        b0, b1 = analysis.body(x[:, int(lo * sr):int(hi * sr)], sr)
+        a = item.start + off if item.start is not None else (lo + b0 / sr if i > 0 else lo)
+        b = min(item.end + off, total) if item.end is not None else (lo + b1 / sr if i < last else hi)
         if not 0 <= a < b or b - a < 4.0:
-            raise HTTPException(400, f"part {item.take}: the span must be at least 4 s inside the take (0..{total:.1f} s)")
-        parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)],
-                      "start": round(a, 2), "end": round(b, 2)})
+            raise HTTPException(400, f"part {item.take}: the span must be at least 4 s inside the take "
+                                     f"(0..{hi - lo:.1f} s as it plays)")
+        # Each part at its delivered loudness (its mastering gain; the song is mastered again as a
+        # whole): a quiet recording joined to a generated take would otherwise be 30 dB under it.
+        g = 10 ** (float(tp.get("gain_db", 0.0)) / 20)
+        parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)] * g,
+                      "start": round(max(0.0, a - off), 2), "end": round(b - off, 2),
+                      "dropped_s": round((b0 / sr if i > 0 and item.start is None else 0.0)
+                                         + ((hi - lo) - b1 / sr if i < last and item.end is None else 0.0), 1)})
     first = parts[0]["src"]
     tempo = parts[0]["take"].get("music", {}).get("tempo", {})
     bpm = first.get("bpm") or (tempo.get("bpm") if tempo.get("confidence", 0) >= checks.TEMPO_CONFIDENT else None)
@@ -1041,7 +1076,10 @@ def arrange(req: ArrangeReq):
                           parts=[{"take": p["ref"], "name": p["src"]["name"], "start": p["start"], "end": p["end"]}
                                  for p in parts],  # the spans as used
                           bridge=round(bridge, 2), blend=req.blend, duration=round(total_s, 2), post=po.asdict(),
-                          clap_prompt=first["prompt"] or None, warnings=_arrangement_warnings(parts))
+                          clap_prompt=first["prompt"] or None,
+                          warnings=_arrangement_warnings(parts) + [
+                              f"{p['ref']}: {p['dropped_s']:g} s of fade or quiet edge left out at its join(s) "
+                              "(give a span to keep it)" for p in parts if p["dropped_s"] >= 3])
         d = req_dir(rec["id"])
         t0 = time.time()
         joins = []
