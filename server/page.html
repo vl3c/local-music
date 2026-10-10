@@ -330,7 +330,11 @@ function show(res) {
       el("button", {class: "link", text: "delete", onclick: async () => {
         if (!confirm("Delete every file of " + res.id + "?")) return;
         try {
-          await api("/api/requests/" + res.id, undefined, "DELETE");
+          try { await api("/api/requests/" + res.id, undefined, "DELETE"); }
+          catch (e) {  // other requests were made from it (409): say which, and ask again
+            if (!/is used by/.test(e.message) || !confirm(e.message + "\n\nDelete it anyway?")) throw e;
+            await api("/api/requests/" + res.id + "?force=true", undefined, "DELETE");
+          }
           song = song.filter(p => !p.take.startsWith(res.id + ":")); saveSong(); drawSong();
           current = null; $("view").replaceChildren(); history();
         } catch (e) { $("msg").textContent = e.message; }

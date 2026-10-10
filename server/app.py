@@ -63,7 +63,7 @@ for _k, _v in {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISAB
 import uvicorn  # noqa: E402
 from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse  # noqa: E402
-from pydantic import BaseModel, Field, field_validator  # noqa: E402
+from pydantic import BaseModel, Field, field_validator, model_validator  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
@@ -389,7 +389,7 @@ class GenReq(ShapeFields):
     kind: Literal["music", "stem"] = "music"
     raw: bool | None = None
     negative: str | None = Field(None, max_length=500)
-    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9_-]*$")
 
     @field_validator("text")
     @classmethod
@@ -897,13 +897,14 @@ MAX_IMPORT_S = 1200.0
 @app.post("/api/import")
 async def import_audio(request: Request, filename: str = Query(min_length=1, max_length=200),
                        text: str | None = Query(None, max_length=1000), kind: Literal["music", "stem"] = "music",
-                       name: str | None = Query(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$"),
-                       check: bool | None = None):
+                       name: str | None = Query(None, max_length=60, pattern=r"^[A-Za-z0-9_-]*$"),
+                       check: bool | None = None, trim: bool = True):
     """Your own audio file (the request body, as raw bytes: WAV, FLAC, OGG or MP3) becomes a
     take (seed 0) of an "import" request: checked, measured and mastered like any other, so
     extend, vary, inpaint, arrange and master all work from its ref. `text` describes it
     (it becomes the prompt that work continues from; without it the engine is led by the
-    audio alone)."""
+    audio alone). trim=false keeps silence at the start and end, so the take keeps the file's
+    timeline (a voice whose word timings come from elsewhere)."""
     size = int(request.headers.get("content-length") or 0)
     if size > MAX_IMPORT_BYTES:
         raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
@@ -915,10 +916,11 @@ async def import_audio(request: Request, filename: str = Query(min_length=1, max
     if not data:
         raise HTTPException(400, "no audio in the request body")
     data = bytes(data)
-    return await run_in_threadpool(_import, data, filename, text, kind, name, check)
+    return await run_in_threadpool(_import, data, filename, text, kind, name, check, trim)
 
 
-def _import(data: bytes, filename: str, text: str | None, kind: str, name: str | None, check: bool | None) -> dict:
+def _import(data: bytes, filename: str, text: str | None, kind: str, name: str | None, check: bool | None,
+            trim: bool = True) -> dict:
     import soundfile as sf
     base = Path(filename.replace("\\", "/")).name or "audio"
     warnings = []
@@ -962,7 +964,7 @@ def _import(data: bytes, filename: str, text: str | None, kind: str, name: str |
                "prompt": prompt, "raw": False, "bpm": None, "key": None,
                "name": name or prompts.file_name(Path(base).stem), "source": base,
                "duration": round(x.shape[1] / RAW_SR, 2), "gen_length_s": round(x.shape[1] / RAW_SR, 2), "gen_s": 0.0,
-               "post": default_master(opt, None), "warnings": warnings}
+               "post": {**default_master(opt, None), "trim_silence": trim}, "warnings": warnings}
         path = d / "import.wav"
         audio.write_wav(path, x, RAW_SR, subtype="FLOAT")
         return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
@@ -977,6 +979,7 @@ class PartItem(BaseModel):
     take: str
     start: float | None = Field(None, ge=0)  # seconds on the take's raw timeline; default its start
     end: float | None = Field(None, gt=0)    # default its end
+    gain_db: float = Field(0.0, ge=-40, le=12)  # its volume in the song, against its delivered loudness
 
 
 class ArrangeReq(ShapeFields):
@@ -984,7 +987,7 @@ class ArrangeReq(ShapeFields):
     bridge: float | None = Field(None, ge=0, le=30)  # new music between parts; default 2 bars (4 s without a tempo)
     blend: float = Field(1.0, ge=0.25, le=6)         # seconds of each part regenerated beside the bridge
     text: str | None = Field(None, max_length=1000)  # what the bridges should be; default the first part's prompt
-    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9_-]*$")
 
     @field_validator("text")
     @classmethod
@@ -1049,8 +1052,10 @@ def arrange(req: ArrangeReq):
                                      f"(0..{hi - lo:.1f} s as it plays)")
         # Each part at its delivered loudness (its mastering gain; the song is mastered again as a
         # whole): a quiet recording joined to a generated take would otherwise be 30 dB under it.
-        g = 10 ** (float(tp.get("gain_db", 0.0)) / 20)
+        # Its own volume on top: a quiet intro before a loud main part.
+        g = 10 ** ((float(tp.get("gain_db", 0.0)) + item.gain_db) / 20)
         parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)] * g,
+                      "gain_db": item.gain_db,
                       "start": round(max(0.0, a - off), 2), "end": round(b - off, 2),
                       "dropped_s": round((b0 / sr if i > 0 and item.start is None else 0.0)
                                          + ((hi - lo) - b1 / sr if i < last and item.end is None else 0.0), 1)})
@@ -1073,7 +1078,8 @@ def arrange(req: ArrangeReq):
         rec = _new_record("arrange", opt, w.info, engine, seeds, kind=first.get("kind", "music"),
                           text=req.text or first.get("text", ""), prompt=prompt, raw=bool(first.get("raw")),
                           bpm=first.get("bpm"), key=first.get("key"), name=name[:60],
-                          parts=[{"take": p["ref"], "name": p["src"]["name"], "start": p["start"], "end": p["end"]}
+                          parts=[{"take": p["ref"], "name": p["src"]["name"], "start": p["start"], "end": p["end"],
+                                  **({"gain_db": p["gain_db"]} if p["gain_db"] else {})}
                                  for p in parts],  # the spans as used
                           bridge=round(bridge, 2), blend=req.blend, duration=round(total_s, 2), post=po.asdict(),
                           clap_prompt=first["prompt"] or None,
@@ -1130,47 +1136,89 @@ def arrange(req: ArrangeReq):
 
 # --------------------------------------------------------------------------- mixing takes
 
+class SpanGain(BaseModel):
+    start: float = Field(ge=0)                   # seconds on the take's timeline, as it plays
+    end: float = Field(gt=0)
+    gain_db: float = Field(ge=-40, le=20)
+
+
 class MixLayer(BaseModel):
     take: str
     gain_db: float = Field(0.0, ge=-60, le=12)  # its volume in the mix
     at: float = Field(0.0, ge=0, le=1200)       # where it starts in the mix, seconds
     start: float | None = Field(None, ge=0)     # a span of the take (its delivered timeline)
     end: float | None = Field(None, gt=0)
+    spans: list[SpanGain] = Field(default_factory=list, max_length=32)  # louder / quieter in places
+    reverb: Literal["none", "room", "hall", "cathedral"] = "none"  # a space for a dry layer (a voice)
+    voice: bool = False                          # speech: check it stays clear of the rest of the mix
+
+    @model_validator(mode="after")
+    def _spans_in_order(self):
+        for sp in self.spans:
+            if sp.end <= sp.start:
+                raise ValueError(f"a span's end must come after its start ({sp.start:g}-{sp.end:g})")
+        return self
 
 
 class MixReq(MasterFields):
     layers: list[MixLayer] = Field(min_length=2, max_length=8)
-    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9_-]*$")
     check: bool | None = None
 
 
 @app.post("/api/mix")
 def mix(req: MixReq):
     """Takes on top of each other, as one new take: each layer is a take's delivered track (what
-    you hear: mastered, or its loop) at its own volume (gain_db), starting `at` seconds in.
-    Nothing is levelled or ducked automatically. The sum is mastered like any take (so the mix's
-    overall loudness is the usual target; the volumes set the balance), and is a take itself
-    (seed 0), so it can be extended, looped or re-mastered."""
+    you hear: its fades, cut or loop, at its loudness) at its own volume (gain_db), starting `at`
+    seconds in. A layer joins before its own peak limiter: the mix is limited once, as a whole,
+    so a voice's loud moments aren't flattened on the way in. Nothing is levelled or ducked
+    automatically; `spans` raise or lower a layer in places, `reverb` puts a dry layer in a room
+    (at the same loudness), and a `voice` layer is checked for staying above the rest in the
+    speech band. The sum is mastered like any take (so the mix's overall loudness is the usual
+    target; the volumes set the balance), and is a take itself (seed 0), so it can be extended,
+    looped or re-mastered."""
     opt = effective_settings()
     if req.check is not None:
         opt["check"] = req.check
     layers, srcs, desc = [], [], []
     for item in req.layers:
-        src, take, _ = _source(item.take)
-        y, sr = audio.read(req_dir(src["id"]) / take["wav"])
+        src, take, raw_path = _source(item.take)
+        raw, rsr = audio.read(raw_path)
+        try:  # the delivered track, before its limiter
+            y, lrep = post.process(raw, rsr, post.PostOpts(**src["post"]), take.get("beats"), limit_peaks=False)
+        except ValueError as exc:
+            raise HTTPException(400, f"layer {item.take}: {exc}") from exc
+        sr = audio.SR
         total = y.shape[1] / sr
         a = item.start or 0.0
         b = total if item.end is None else min(item.end, total)
         if not 0 <= a or b - a < 0.1:
             raise HTTPException(400, f"layer {item.take}: the span must lie inside the take (0..{total:.1f} s) "
                                      "and last at least 0.1 s")
-        layers.append(post.Layer(audio=y[:, int(a * sr):int(b * sr)], gain_db=item.gain_db, offset_s=item.at))
+        for sp in item.spans:
+            if sp.start >= b or sp.end <= a:
+                raise HTTPException(400, f"layer {item.take}: the gain span {sp.start:g}-{sp.end:g} s is outside "
+                                         f"the part of the take in the mix ({a:g}-{b:.1f} s)")
+        part = post.gain_spans(y[:, int(a * sr):int(b * sr)], sr,
+                               [(sp.start - a, sp.end - a, sp.gain_db) for sp in item.spans])
+        if item.reverb != "none":
+            part = post.add_reverb(part, sr, item.reverb)
+        layers.append(post.Layer(audio=part, gain_db=item.gain_db, offset_s=item.at))
         srcs.append(src)
-        desc.append({"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
-                     "start": round(a, 2), "end": round(b, 2)})
+        d = {"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
+             "start": round(a, 2), "end": round(b, 2),
+             "lufs": round(lrep["lufs"] + item.gain_db, 1)}  # how loud it plays in the mix, before mastering
+        if item.spans:
+            d["spans"] = [sp.model_dump() for sp in item.spans]
+        if item.reverb != "none":
+            d["reverb"] = item.reverb
+        if item.voice:
+            d["voice"] = True
+        desc.append(d)
     base = srcs[0]  # the first layer's prompt, tempo and key carry on (extending the mix uses them)
     with _lock:
         y, rep = post.mix_layers(layers, audio.SR)
+        warnings = _voice_warnings(layers, desc, y)
         raw = audio.resample(y, audio.SR, RAW_SR)
         rid = new_id()
         d = OUTPUT / rid
@@ -1180,11 +1228,34 @@ def mix(req: MixReq):
                "model": "mix", "seeds": [0], "steps": None, "takes": [], "kind": base.get("kind", "music"),
                "text": base.get("text", ""), "prompt": base["prompt"], "raw": bool(base.get("raw")),
                "bpm": base.get("bpm"), "key": base.get("key"),
-               "name": (req.name or f"{base['name']}-mix")[:60], "layers": desc, "duration": rep["length_s"], "gen_length_s": rep["length_s"], "gen_s": 0.0, "post": po.asdict(),
-               "warnings": []}
+               "name": (req.name or f"{base['name']}-mix")[:60], "layers": desc, "duration": rep["length_s"],
+               "gen_length_s": rep["length_s"], "gen_s": 0.0, "post": po.asdict(), "warnings": warnings}
         path = d / "mix.wav"
         audio.write_wav(path, raw, RAW_SR, subtype="FLOAT")
         return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
+
+
+def _voice_warnings(layers: list[post.Layer], desc: list[dict], mixed: np.ndarray) -> list[str]:
+    """For each voice layer: how far it sits above the rest of the mix in the speech band
+    (stored as desc[i]["speech_margin"]), and a warning where words may get lost."""
+    out = []
+    for ly, d in zip(layers, desc):
+        if not d.get("voice"):
+            continue
+        alone, _ = post.mix_layers([ly], audio.SR)  # on the mix's timeline already (offset, volume)
+        v = np.zeros_like(mixed)
+        v[:, :alone.shape[1]] = alone
+        m = post.speech_margin(v, mixed - v, audio.SR)
+        d["speech_margin"] = m
+        if m["under"]:
+            spans = ", ".join(f"{a:g}-{b:g} s ({g:+.0f} dB)" for a, b, g in m["under"][:6])
+            out.append(f"voice layer {d['take']} sits under the rest of the mix at {spans}: words there may be "
+                       "lost. Raise its vol, or lower the others there (a span of gain)")
+        elif m["p10_db"] is not None and m["p10_db"] < post.MARGIN_P10_WARN_DB:
+            out.append(f"voice layer {d['take']}: its quieter moments are only {m['p10_db']:+.0f} dB above the rest "
+                       f"in the speech band (median {m['median_db']:+.0f} dB): some words may get lost. About "
+                       f"{post.MARGIN_P10_WARN_DB - m['p10_db']:.0f} dB more voice (or less of the rest) clears it")
+    return out
 
 
 class MasterReq(MasterFields):
@@ -1237,12 +1308,37 @@ def list_requests(limit: int = 20):
     return out
 
 
+def sources_of(rec: dict) -> list[str]:
+    """The takes (refs) a request was made from: its source, its parts, its layers."""
+    refs = [rec["source"]] if isinstance(rec.get("source"), str) and TAKE_REF.fullmatch(rec["source"]) else []
+    return refs + [x["take"] for k in ("parts", "layers") for x in rec.get(k) or [] if isinstance(x, dict) and "take" in x]
+
+
+def users_of(rid: str) -> list[str]:
+    """Requests made from one of rid's takes (an extension, a variation, a song, a mix...)."""
+    out = []
+    for d in sorted(p for p in OUTPUT.iterdir() if p.is_dir() and REQ_ID.fullmatch(p.name) and p.name != rid):
+        try:
+            rec = json.loads((d / "request.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if any(parse_take(r)[0] == rid for r in sources_of(rec) if TAKE_REF.fullmatch(r)):
+            out.append(f"{rec['id']} ({rec.get('op', 'generate')} {rec.get('name', '')})")
+    return out
+
+
 @app.delete("/api/requests/{rid}")
-def delete_request(rid: str):
+def delete_request(rid: str, force: bool = False):
+    """Delete a request's files. Refused (409) while another request was made from one of its
+    takes, since remastering or rebuilding that one needs it: delete those first, or force."""
     d = req_dir(rid)
     if not d.is_dir():
         raise HTTPException(404, f"no request {rid}")
     with _lock:
+        users = users_of(rid)
+        if users and not force:
+            raise HTTPException(409, f"{rid} is used by {', '.join(users[:5])}{' ...' if len(users) > 5 else ''}: "
+                                     "they're made from it. Delete those first, or delete anyway (force)")
         n = sum(1 for p in d.iterdir() if p.is_file())
         for attempt in range(20):  # a file still being streamed to the browser holds the folder
             try:

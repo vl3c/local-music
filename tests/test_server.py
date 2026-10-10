@@ -537,3 +537,101 @@ def test_arrange_records_spans_as_the_take_plays(client):
     res = client.post("/api/arrange", json={"parts": [{"take": imp["takes"][0]["ref"], "start": 2, "end": 14},
                                                      {"take": a}], "n": 1}).json()
     assert (res["parts"][0]["start"], res["parts"][0]["end"]) == (pytest.approx(2.0, abs=0.01), pytest.approx(14.0, abs=0.01))
+
+
+# ------------------------------------------------------------------ mixing: layers before their limiter, edits, the voice check
+
+def voice_import(client, seconds=8.0, loud_end=False, trim=True):
+    """A 'voice': 1 kHz syllables (in the speech band) after 1 s of silence."""
+    n = int(seconds * 48000)
+    t = np.arange(n) / 48000
+    x = (0.1 * np.sin(2 * np.pi * 1000 * t) * (np.sin(2 * np.pi * 3 * t) > -0.6)).astype(np.float32)[None, :]
+    x[:, :48000] = 0.0
+    if loud_end:  # sharp, loud peaks in the last second (high crest, little loudness): what a limiter flattens
+        for k in range(10):
+            i = n - 48000 + k * 4800
+            x[:, i:i + 480] = 0.9
+    params = {"filename": "voice.wav"} if trim else {"filename": "voice.wav", "trim": "false"}
+    r = client.post("/api/import", params=params, content=wav_bytes(x, 48000))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_a_layer_joins_the_mix_before_its_own_limiter(client, server):
+    from music import audio
+    v = voice_import(client, loud_end=True)
+    t = v["takes"][0]
+    assert t["post"]["limiter_db"] > 3  # delivered on its own, the loud end is limited
+    song = gen(client, n=1, duration=12)["takes"][0]["ref"]
+    res = client.post("/api/mix", json={"layers": [{"take": song, "gain_db": -40}, {"take": t["ref"]}],
+                                        "lufs": -30}).json()  # quiet enough that the mix itself isn't limited
+    assert res["takes"][0]["post"]["limiter_db"] == 0.0
+    y, _ = audio.read(server.OUTPUT / res["id"] / "0.wav")
+    delivered, _ = audio.read(server.OUTPUT / v["id"] / "0.wav")
+    n = delivered.shape[1]  # the voice starts the mix: its last second is the mix's n-48000..n
+    rise = lambda z: 20 * np.log10(np.max(np.abs(z[:, n - 48000:n])) / np.max(np.abs(z[:, 48000:4 * 48000])))  # noqa: E731
+    assert rise(y) > rise(delivered) + 3  # the peaks come through as they were, not as the import's limiter left them
+    assert rise(y) == pytest.approx(20 * np.log10(0.9 / 0.1), abs=1.0)
+    ly = res["layers"][1]
+    assert ly["lufs"] == pytest.approx(t["final"]["lufs"], abs=0.5)  # how loud it plays (its target, before its limiter)
+
+
+def test_mix_layer_spans_reverb_and_the_voice_check(client, server):
+    v = voice_import(client, seconds=10.0)["takes"][0]["ref"]
+    song = gen(client, n=1, duration=12)["takes"][0]["ref"]
+    body = {"layers": [{"take": song, "gain_db": 6}, {"take": v, "voice": True, "reverb": "room",
+                                                        "spans": [{"start": 2, "end": 4, "gain_db": 4}]}]}
+    res = client.post("/api/mix", json=body).json()
+    ly = res["layers"][1]
+    assert ly["reverb"] == "room" and ly["spans"] == [{"start": 2.0, "end": 4.0, "gain_db": 4.0}] and ly["voice"]
+    m = ly["speech_margin"]
+    assert m["median_db"] is not None and "speech_margin" not in res["layers"][0]
+    loud = any("voice layer" in w for w in res["warnings"])
+    body["layers"][0]["gain_db"] = -30
+    quiet = client.post("/api/mix", json=body).json()
+    assert quiet["layers"][1]["speech_margin"]["median_db"] > m["median_db"] + 20
+    assert not any("voice layer" in w for w in quiet["warnings"]) and loud
+    body["layers"][1]["spans"] = [{"start": 50, "end": 60, "gain_db": 4}]
+    assert client.post("/api/mix", json=body).status_code == 400  # outside the layer
+    body["layers"][1]["spans"] = [{"start": 4, "end": 2, "gain_db": 4}]
+    assert client.post("/api/mix", json=body).status_code == 422
+    body["layers"][1]["spans"], body["layers"][1]["reverb"] = [], "garage"
+    assert client.post("/api/mix", json=body).status_code == 422
+
+
+def test_import_can_keep_the_files_timeline(client):
+    trimmed = voice_import(client)["takes"][0]
+    kept = voice_import(client, trim=False)["takes"][0]
+    assert trimmed["post"]["trim_start_s"] == pytest.approx(1.0, abs=0.12)
+    assert kept["post"].get("trim_start_s", 0.0) == 0.0
+    assert kept["signal"]["duration_s"] == pytest.approx(8.0, abs=0.01)
+
+
+def test_arrange_part_volumes(client, server):
+    from music import analysis
+    a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20, "gain_db": -8},
+                                                     {"take": b, "start": 0, "end": 20}], "bridge": 2, "n": 1}).json()
+    assert res["parts"][0]["gain_db"] == -8 and "gain_db" not in res["parts"][1]
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    first, second = analysis.lufs(y[:, 2 * SR:16 * SR], SR), analysis.lufs(y[:, 26 * SR:40 * SR], SR)
+    assert second - first == pytest.approx(8.0, abs=1.5)
+
+
+def test_a_request_others_are_made_from_isnt_deleted_unless_forced(client, server):
+    src = gen(client, n=1, duration=12)
+    a = src["takes"][0]["ref"]
+    mixed = client.post("/api/mix", json={"layers": [{"take": a}, {"take": a, "at": 2}]}).json()
+    ext = client.post("/api/extend", json={"take": a, "seconds": 5, "n": 1}).json()
+    r = client.delete(f"/api/requests/{src['id']}")
+    assert r.status_code == 409 and mixed["id"] in r.json()["detail"] and ext["id"] in r.json()["detail"]
+    assert (server.OUTPUT / src["id"]).is_dir()
+    assert client.delete(f"/api/requests/{mixed['id']}").status_code == 200  # nothing is made from the mix
+    assert client.delete(f"/api/requests/{src['id']}?force=true").status_code == 200
+    assert not (server.OUTPUT / src["id"]).exists()
+
+
+def test_names_may_have_underscores(client):
+    assert gen(client, n=1, name="boss_theme-v2")["name"] == "boss_theme-v2"
+    assert client.post("/api/generate", json={"text": "x", "name": "no spaces"}).status_code == 422

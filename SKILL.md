@@ -112,7 +112,9 @@ $PY $M --master <request id> --no-loop --fade-out 5 --lufs -16
 $PY $M --import <file> "a slow acoustic folk song"            # the user's audio as a take (ref <id>:0)
 $PY $M "a warm music box melody" --vary <file> --strength 0.5    # files work directly too
 $PY $M "a big drum fill and a riser" --combine <intro ref> <main ref>@0-40 <outro ref>   # one song
-$PY $M --mix <song ref>,vol=-9 <voice ref>,at=4                 # a voice over a song (import the voice first)
+$PY $M --mix <song ref>,vol=-9 voice.wav,at=4,voice              # a voice over a song (a file or a ref)
+$PY $M --show <ref> --out <dir>                                 # deliver that very take, whatever its rank
+$PY $M --export <ref> --out <dir>                               # the take + everything it's made from, kept
 $PY $M --show-prompt "dark synthwave" --bpm 100                 # what the engine would get
 $PY $M --list
 $PY $M --show <request id>
@@ -134,7 +136,7 @@ response (plus `delivered`): parse that rather than the text.
 | `--length S`, `--fade-in S`, `--fade-out S` | Cut, fades. `--fade-out` unset = automatic (3 s, only if the take stops at full level); `0` keeps a hard cut. |
 | `--lufs X`, `--peak X` | Loudness (default -14 LUFS: music on its own; -16 to -20 under dialogue or as a background bed) and true-peak ceiling (default -1 dBTP). |
 | `--loop-bars N` | A seamless loop of N bars (4/4 unless `--beats-per-bar`). Give `--bpm` when generating. |
-| `--out DIR` | Deliver the best (`--best N`, `--all`) as `<name>_vNN.wav/.mp3/.json` (`--format`, `--png`, `--name`). Never overwrites. |
+| `--out DIR` | Deliver the best (`--best N`, `--all`) as `<name>_vNN.wav/.mp3/.json` (`--format`, `--png`, `--name`). Never overwrites. **To deliver the take you chose** (not the top-ranked one): `--pick SEED` with the request, or `--show REQ:SEED --out DIR` afterwards. |
 | `--play` | Play the best take on the user's speakers (only if they asked to hear it). |
 | `--no-save` | Delete the request from `output/` afterwards. |
 
@@ -214,10 +216,24 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   straight into each other. Parts are cut to their body at the joins (fades and silence would
   make silent bridges); `REF@START-END` picks a span yourself. Read the result's PNG at each
   join: the bar grid should run through, the loudness shouldn't fall into a hole.
-- **A voice (or any layer) over a song**: `--import voice.mp3`, then `--mix <song ref>,vol=-9
-  <voice ref>,at=4`. Each layer is at the volume you give (default 0 dB, both at the same
-  loudness); nothing is ducked or levelled for you: the user decides the balance, so ask, or
-  offer two or three balances (song at -6 / -9 / -12) rather than picking one silently.
+- **A voice (or any layer) over a song**: `--mix <song ref>,vol=-9 voice.wav,at=4,voice`. A
+  file is imported as it is (silence kept, so word timings from the voice tool still line up:
+  mix time = `at` + the voice's own time). vol=0 means each layer at its delivered loudness,
+  printed per layer (`plays at -17 LUFS`): a voice imported at -14 sits 3 dB over a bed
+  delivered at -17. Nothing is ducked or levelled for you: the user decides the balance, so
+  ask, or offer two or three balances (song at -6 / -9 / -12) rather than picking one silently.
+  Layers are mixed before their own limiter, so a sung or shouted last word keeps its punch.
+  Per layer: `boost=A-B:+4` (louder there, e.g. a held last word; repeatable), `reverb=room`
+  (a dry voice sits better in the music; `hall`/`cathedral` for more), and `voice`, which
+  warns where the voice falls under the music in the speech band: words there may be lost.
+  The warning is a proxy: if the local-voice tool is installed, its Whisper is the real check.
+- **Background music under a voice**: describe a bed, not a showpiece ("restrained", "background
+  music", "slowly building tension", "holding back"); a full climax or a drop fights the voice
+  for attention even at -9 dB. For a quiet part and a loud part in one song, give the quiet
+  part a lower volume in the combine (`REF@0-35,vol=-6`): parts otherwise join at the same
+  delivered loudness, and the contrast is lost.
+- **Let the user pick by ear before building on it**: send two or three candidates (an MP3
+  each) before a long chain (combine, inpaint, mix): the scores can't tell which one fits.
 
 ## 6. Delivering
 
@@ -229,3 +245,9 @@ memory (offer to stop it when they're done).
 
 Everything a request made stays in `~/.claude/skills/local-music/output/<request id>/`
 (raw take, master, MP3, PNG, `request.json`); `--no-save` or `--delete <id>` removes it.
+
+**Keeping a final**: before any cleanup, `--export <final ref> --out <dir>/source` copies the
+final and every request it was made from (the takes, imports, parts and layers, all the way
+back) with a manifest; copying those folders back into `output/` restores every ref, so the
+final can be re-mastered or remixed later. `--delete` refuses a request another one was made
+from (409; `--force` overrides): delete the leaves first, or export what you keep.

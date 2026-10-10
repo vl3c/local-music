@@ -126,11 +126,13 @@ def limit(x: np.ndarray, sr: int, ceiling_db: float, lookahead_s: float = 0.0015
     return y, float(gr.max())
 
 
-def master(x: np.ndarray, sr: int, lufs: float, peak_dbtp: float) -> tuple[np.ndarray, dict]:
+def master(x: np.ndarray, sr: int, lufs: float, peak_dbtp: float, limit_peaks: bool = True) -> tuple[np.ndarray, dict]:
     """Normalise to `lufs` integrated loudness, then limit to the `peak_dbtp` true-peak ceiling.
 
     Limiting takes loudness off the top, so the gain is re-measured and corrected after it, up
     to three times (a dense track pushed 4 dB into the limiter otherwise lands 1 dB short).
+    limit_peaks=False stops after the gain: the track at its loudness with its peaks intact
+    (a mix layer, which is limited once, as part of the mix).
     """
     x = as2d(x)
     before = analysis.lufs(x, sr)
@@ -138,6 +140,10 @@ def master(x: np.ndarray, sr: int, lufs: float, peak_dbtp: float) -> tuple[np.nd
         return x, {"lufs_before": round(before, 1), "gain_db": 0.0, "limiter_db": 0.0, "lufs": round(before, 1),
                    "true_peak_dbtp": round(analysis.true_peak_db(x, sr), 2)}
     gain = lufs - before
+    if not limit_peaks:
+        y = (x * 10 ** (gain / 20)).astype(np.float32)
+        return y, {"lufs_before": round(before, 1), "gain_db": round(gain, 2), "limiter_db": 0.0,
+                   "lufs": round(lufs, 1), "true_peak_dbtp": round(analysis.true_peak_db(y, sr), 2)}
     for _ in range(3):
         # Sample peaks are limited 0.3 dB under the ceiling; inter-sample peaks can still poke
         # over, which the true-peak trim below takes care of.
@@ -282,11 +288,13 @@ def seam_report(y: np.ndarray, sr: int, follow: np.ndarray) -> dict:
 
 # --------------------------------------------------------------------------- the whole chain
 
-def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None = None) -> tuple[np.ndarray, dict]:
+def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None = None,
+            limit_peaks: bool = True) -> tuple[np.ndarray, dict]:
     """Raw engine output -> the delivered 48 kHz track, and a report of what was done.
 
     `beats` (seconds, on the raw audio's timeline) are needed for loops; the caller measures
-    them once per take (analysis.tempo_and_beats).
+    them once per take (analysis.tempo_and_beats). limit_peaks=False: the same track before
+    its limiter (see master).
     """
     x = resample(as2d(raw), sr, SR)
     rep: dict = {}
@@ -299,7 +307,7 @@ def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None 
         follow = x[:, lp["start"] + lp["length"]:lp["start"] + lp["length"] + int(0.2 * SR)]
         rep.update(seam_report(y, SR, follow))  # before mastering: the same gain on both sides
         # No fades on a loop: they would be heard at every repeat.
-        y, m = master(y, SR, opts.lufs, opts.peak_dbtp)
+        y, m = master(y, SR, opts.lufs, opts.peak_dbtp, limit_peaks)
         rep.update(m)
     else:
         if opts.trim_silence:
@@ -315,7 +323,7 @@ def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None 
             rep["auto_fade_out_s"] = round(fade_out, 2)
         rep["fade_out_s"] = round(fade_out, 2)
         y = fade(x, SR, opts.fade_in, fade_out)
-        y, m = master(y, SR, opts.lufs, opts.peak_dbtp)
+        y, m = master(y, SR, opts.lufs, opts.peak_dbtp, limit_peaks)
         rep.update(m)
     rep["length_s"] = round(y.shape[1] / SR, 3)
     return y, rep
@@ -344,6 +352,121 @@ def mix_layers(layers: list[Layer], sr: int) -> tuple[np.ndarray, dict]:
         a = np.vstack([a, a]) if a.shape[0] == 1 else a[:2]
         out[:, s:s + a.shape[1]] += a * 10 ** (ly.gain_db / 20)
     return out, {"length_s": round(n / sr, 3)}
+
+
+SPAN_RAMP_S = 0.03  # a span's gain fades in and out over this, inside the span: no clicks
+
+# A space for a dry layer (a voice recorded or generated without a room). Convolution with a
+# seeded, exponentially decaying stereo noise tail whose highs die faster than its lows:
+# (RT60 seconds, wet, dry, pre-delay ms). The names, and roughly the rooms, are local-voice's.
+REVERBS = {
+    "room": (0.6, 0.16, 0.92, 0.0),
+    "hall": (1.8, 0.26, 0.86, 20.0),
+    "cathedral": (3.5, 0.24, 0.88, 40.0),
+}
+
+
+def gain_spans(x: np.ndarray, sr: int, spans: list[tuple[float, float, float]]) -> np.ndarray:
+    """x with each (start_s, end_s, gain_db) span raised or lowered; overlapping spans add up.
+    The change ramps in and out over SPAN_RAMP_S inside the span."""
+    x = as2d(x)
+    if not spans:
+        return x
+    n = x.shape[1]
+    db = np.zeros(n, np.float64)
+    for a, b, g in spans:
+        i, j = max(0, int(round(a * sr))), min(n, int(round(b * sr)))
+        if j <= i:
+            continue
+        env = np.ones(j - i)
+        r = min(int(SPAN_RAMP_S * sr), (j - i) // 2)
+        if r > 0:
+            env[:r] = np.linspace(0.0, 1.0, r)
+            env[-r:] = np.linspace(1.0, 0.0, r)
+        db[i:j] += g * env
+    return (x * (10 ** (db / 20))[None, :]).astype(np.float32)
+
+
+def reverb_ir(kind: str, sr: int) -> np.ndarray:
+    """The impulse response of a REVERBS space: (2, n), unit energy per channel."""
+    from scipy.signal import lfilter
+    rt60, _, _, pre_ms = REVERBS[kind]
+    n = int(rt60 * 1.2 * sr)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(1)  # the same room every time
+    out = []
+    for _ in range(2):  # decorrelated left and right: width
+        bright = rng.standard_normal(n) * np.exp(-6.9 * t / (rt60 * 0.5))
+        dark = lfilter([0.15], [1.0, -0.85], rng.standard_normal(n)) * np.exp(-6.9 * t / rt60)
+        ir = bright + 2.5 * dark
+        ir[: int(0.005 * sr)] *= np.linspace(0.0, 1.0, int(0.005 * sr))
+        ir = np.concatenate([np.zeros(int(pre_ms / 1000 * sr)), ir])
+        out.append(ir / np.sqrt(np.sum(ir ** 2)))
+    return np.vstack(out).astype(np.float32)
+
+
+def add_reverb(x: np.ndarray, sr: int, kind: str) -> np.ndarray:
+    """x in a REVERBS space, its tail added at the end, at the same integrated loudness as x
+    (so a layer's volume in a mix means the same with or without the room)."""
+    from scipy.signal import fftconvolve
+    x = as2d(x)
+    x = np.vstack([x, x]) if x.shape[0] == 1 else x[:2]
+    _, wet_l, dry_l, _ = REVERBS[kind]
+    ir = reverb_ir(kind, sr)
+    wet = np.vstack([fftconvolve(x[c], ir[c]) for c in range(2)])
+    y = wet * wet_l
+    y[:, : x.shape[1]] += x * dry_l
+    before, after = analysis.lufs(x, sr), analysis.lufs(y, sr)
+    if before > -70 and after > -70:
+        y *= 10 ** ((before - after) / 20)
+    return y.astype(np.float32)
+
+
+SPEECH_BAND = (300.0, 3400.0)  # where the words are: what decides whether a voice is followed
+MARGIN_WIN_S = 0.5
+MARGIN_MIN_RUN_S = 1.0
+MARGIN_P10_WARN_DB = 6.0  # a voice whose quietest tenth sits closer than this to the music loses words
+
+
+def speech_margin(voice: np.ndarray, rest: np.ndarray, sr: int) -> dict:
+    """How far a voice sits above everything else in the speech band, while it speaks.
+
+    Both on the mix's timeline, at their mix volumes. Per 0.5 s window where the voice is
+    speaking (within 20 dB of its loudest), the voice's band energy over the rest's, in dB.
+    Returns the median and the 10th percentile, and the spans (seconds) of at least
+    MARGIN_MIN_RUN_S where the voice stays under the rest (margin < 0 dB), with the worst margin
+    in each: where words get lost. (A single quiet syllable or breath dips under the music at any
+    sensible balance: those aren't spans.) A proxy, calibrated against Whisper on real mixes.
+    """
+    from scipy.signal import butter, sosfilt
+    sos = butter(4, SPEECH_BAND, btype="band", fs=sr, output="sos")
+    v = sosfilt(sos, as2d(voice).mean(axis=0).astype(np.float64))
+    o = sosfilt(sos, as2d(rest).mean(axis=0).astype(np.float64))
+    w = int(MARGIN_WIN_S * sr)
+    k = min(len(v), len(o)) // w
+    if k == 0:
+        return {"median_db": None, "p10_db": None, "under": []}
+    ev = 10 * np.log10(np.mean(v[: k * w].reshape(k, w) ** 2, axis=1) + 1e-12)
+    eo = 10 * np.log10(np.mean(o[: k * w].reshape(k, w) ** 2, axis=1) + 1e-12)
+    active = ev > np.percentile(ev, 95) - 20.0
+    if not np.any(active):
+        return {"median_db": None, "p10_db": None, "under": []}
+    m = ev - eo
+    under, run = [], None
+    for i in range(k):
+        if active[i] and m[i] < 0:
+            if run is None:
+                run = [i, i, m[i]]
+            else:
+                run[1], run[2] = i, min(run[2], m[i])
+        elif run is not None and (active[i] or i - run[1] > 1):  # a pause of one window doesn't split a run
+            under.append(run)
+            run = None
+    if run is not None:
+        under.append(run)
+    return {"median_db": round(float(np.median(m[active])), 1), "p10_db": round(float(np.percentile(m[active], 10)), 1),
+            "under": [[round(a * MARGIN_WIN_S, 1), round((b + 1) * MARGIN_WIN_S, 1), round(float(g), 1)]
+                      for a, b, g in under if (b + 1 - a) * MARGIN_WIN_S >= MARGIN_MIN_RUN_S]}
 
 
 # --------------------------------------------------------------------------- keeping originals

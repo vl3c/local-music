@@ -146,3 +146,55 @@ def test_keep_outside_extends_where_the_original_ends():
     out = post.keep_outside(x, r, 1000, 1500, 50)  # an extension: the mask runs to the end
     assert out.shape == (2, 1500) and np.all(out[:, :950] == 1.0) and np.all(out[:, 1000:] == 2.0)
     assert 1.0 < out[0, 975] < 2.0
+
+
+# ------------------------------------------------------------------ mix layers
+
+def test_a_layer_can_be_mastered_without_its_limiter():
+    x = band(120, 8.0) * 3.0  # at -9 LUFS the limiter takes several dB off its peaks
+    limited, rl = post.master(x, SR, -9.0, -1.0)
+    free, rf = post.master(x, SR, -9.0, -1.0, limit_peaks=False)
+    assert rl["limiter_db"] > 1.0 and rf["limiter_db"] == 0.0
+    assert abs(analysis.lufs(free, SR) - -9.0) < 0.1  # the same loudness...
+    assert np.max(np.abs(free)) > np.max(np.abs(limited))  # ...with its peaks intact
+    assert np.allclose(free, x * 10 ** (rf["gain_db"] / 20), rtol=2e-3, atol=1e-6)  # nothing but the gain (rounded)
+
+
+def test_gain_spans_ramp_in_and_add_up():
+    x = np.ones((2, 4 * SR), np.float32)
+    y = post.gain_spans(x, SR, [(1.0, 2.0, 6.0), (1.5, 3.0, -6.0)])
+    assert y[0, int(0.5 * SR)] == 1.0 and y[0, int(3.5 * SR)] == 1.0  # untouched outside
+    assert y[0, int(1.25 * SR)] == pytest.approx(10 ** (6 / 20), rel=1e-4)
+    assert y[0, int(1.75 * SR)] == pytest.approx(1.0, rel=1e-4)  # +6 and -6 overlap
+    assert y[0, int(2.5 * SR)] == pytest.approx(10 ** (-6 / 20), rel=1e-4)
+    assert y[0, SR] == pytest.approx(1.0, abs=1e-3)  # the ramp starts at the span's edge: no step
+    assert np.array_equal(post.gain_spans(x, SR, []), x)
+
+
+def test_reverb_adds_a_tail_at_the_same_loudness():
+    x = np.zeros((1, 3 * SR), np.float32)
+    x[0, :SR] = 0.3 * np.sin(2 * np.pi * 220 * np.arange(SR) / SR)
+    for kind, rt60 in (("room", 0.6), ("cathedral", 3.5)):
+        y = post.add_reverb(x, SR, kind)
+        assert y.shape[0] == 2 and y.shape[1] > x.shape[1]
+        assert abs(analysis.lufs(y, SR) - analysis.lufs(np.vstack([x, x]), SR)) < 0.3  # as loud as it was, in stereo
+        tail = 20 * np.log10(np.sqrt(np.mean(y[:, SR + int(0.2 * SR):SR + int(0.4 * SR)] ** 2)) + 1e-12)
+        assert tail > -60  # it rings on after the sound stops
+    assert np.array_equal(post.reverb_ir("room", SR), post.reverb_ir("room", SR))  # the same room every time
+
+
+def test_speech_margin_finds_where_a_voice_is_buried():
+    n = 12 * SR
+    t = np.arange(n) / SR
+    voice = np.zeros((2, n), np.float32)
+    voice[:, :] = 0.2 * np.sin(2 * np.pi * 1000 * t) * (np.sin(2 * np.pi * 3 * t) > -0.6)  # syllables, 1 kHz
+    music = np.zeros((2, n), np.float32)
+    rng = np.random.default_rng(0)
+    music[:, 6 * SR:9 * SR] = rng.standard_normal((2, 3 * SR)) * 0.5  # a loud burst at 6-9 s
+    m = post.speech_margin(voice, music, SR)
+    assert m["median_db"] > 20
+    assert len(m["under"]) == 1
+    a, b, worst = m["under"][0]
+    assert 5.5 <= a <= 6.5 and 8.5 <= b <= 9.5 and worst < 0
+    quiet = post.speech_margin(voice, music * 0.01, SR)
+    assert quiet["under"] == [] and quiet["p10_db"] > post.MARGIN_P10_WARN_DB
