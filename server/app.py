@@ -53,7 +53,11 @@ SETTINGS_FILE = REPO / "config.local.json"
 sys.path.insert(0, str(REPO))
 # Everything is loaded from models/: never let a library reach for the network.
 for _k, _v in {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
-               "DO_NOT_TRACK": "1", "TRANSFORMERS_VERBOSITY": "error"}.items():
+               "DO_NOT_TRACK": "1", "TRANSFORMERS_VERBOSITY": "error",
+               # The Intel Fortran runtime that comes with torch's maths libraries installs its own
+               # console handler, which aborts the process when the window closes ("forrtl: error
+               # (200)") before anything else can run. Off: the server's own handler cleans up instead.
+               "FOR_DISABLE_CONSOLE_CTRL_HANDLER": "1"}.items():
     os.environ[_k] = _v
 
 import uvicorn  # noqa: E402
@@ -1199,6 +1203,27 @@ def page():
     return (Path(__file__).parent / "page.html").read_text(encoding="utf-8")
 
 
+_ctrl_handler = None  # kept referenced: Windows calls it from its own thread
+
+
+def _clean_up_on_console_close() -> None:
+    """Closing the server's window ends the process without running atexit: delete the PID file
+    and stop the engine worker first, then let Windows end it as usual."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    global _ctrl_handler
+
+    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+    def handler(event: int) -> int:
+        if event in (2, 5, 6):  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+            PID_FILE.unlink(missing_ok=True)
+            _stop_workers()
+        return 0  # not handled: the default handler ends the process
+    _ctrl_handler = handler
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
+
+
 _instance_lock = None
 
 
@@ -1251,6 +1276,7 @@ def main() -> None:
     OUTPUT.mkdir(exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="ascii")
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+    _clean_up_on_console_close()
     if not args.lazy:
         names = [s.strip() for s in (args.engines or effective_settings()["engine"]).split(",") if s.strip()]
         with _lock:
