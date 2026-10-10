@@ -17,8 +17,8 @@ rejects the broken ones and returns them all ranked. Its files live in output/<i
 
 Kinds of request: generate (text to music), extend (continue a take), vary (a variation
 of a take: audio to audio), inpaint (regenerate a span of a take), import (your own audio
-file, as a take the others can start from) and arrange (several takes in order, with a bridge
-written between each two). /api/master re-masters a request's takes (length, fades,
+file, as a take the others can start from), arrange (several takes in order, with a bridge
+written between each two) and mix (takes on top of each other, each at its own volume). /api/master re-masters a request's takes (length, fades,
 loudness, loop) without regenerating.
 """
 
@@ -599,7 +599,7 @@ def take_view(rec: dict, take: dict) -> dict:
 def request_view(rec: dict) -> dict:
     keep = ("id", "created", "op", "kind", "text", "prompt", "negative", "raw", "bpm", "key", "name", "engine",
             "model", "seeds", "steps", "duration", "source", "seconds", "strength", "span", "parts", "bridge",
-            "blend", "post", "gen_length_s", "gen_s", "score_s", "warnings")
+            "blend", "layers", "post", "gen_length_s", "gen_s", "score_s", "warnings")
     out = {k: rec[k] for k in keep if k in rec}
     out["takes"] = [take_view(rec, t) for t in rec["takes"]]
     out["kept"] = sum(not t.get("rejected") for t in rec["takes"])
@@ -1048,6 +1048,64 @@ def arrange(req: ArrangeReq):
             shutil.rmtree(d, ignore_errors=True)
             raise HTTPException(500, f"stitching failed: {type(exc).__name__}: {exc}") from exc
         return _finish(rec, {"files": files}, opt)
+
+
+# --------------------------------------------------------------------------- mixing takes
+
+class MixLayer(BaseModel):
+    take: str
+    gain_db: float = Field(0.0, ge=-60, le=12)  # its volume in the mix
+    at: float = Field(0.0, ge=0, le=1200)       # where it starts in the mix, seconds
+    start: float | None = Field(None, ge=0)     # a span of the take (its delivered timeline)
+    end: float | None = Field(None, gt=0)
+
+
+class MixReq(MasterFields):
+    layers: list[MixLayer] = Field(min_length=2, max_length=8)
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+    check: bool | None = None
+
+
+@app.post("/api/mix")
+def mix(req: MixReq):
+    """Takes on top of each other, as one new take: each layer is a take's delivered track (what
+    you hear: mastered, or its loop) at its own volume (gain_db), starting `at` seconds in.
+    Nothing is levelled or ducked automatically. The sum is mastered like any take (so the mix's
+    overall loudness is the usual target; the volumes set the balance), and is a take itself
+    (seed 0), so it can be extended, looped or re-mastered."""
+    opt = effective_settings()
+    if req.check is not None:
+        opt["check"] = req.check
+    layers, srcs, desc = [], [], []
+    for item in req.layers:
+        src, take, _ = _source(item.take)
+        y, sr = audio.read(req_dir(src["id"]) / take["wav"])
+        total = y.shape[1] / sr
+        a = item.start or 0.0
+        b = total if item.end is None else min(item.end, total)
+        if not 0 <= a < b:
+            raise HTTPException(400, f"layer {item.take}: the span must lie inside the take (0..{total:.1f} s)")
+        layers.append(post.Layer(audio=y[:, int(a * sr):int(b * sr)], gain_db=item.gain_db, offset_s=item.at))
+        srcs.append(src)
+        desc.append({"take": item.take, "gain_db": item.gain_db, "at": item.at, "start": round(a, 2),
+                     "end": round(b, 2)})
+    base = srcs[0]  # the first layer's prompt, tempo and key carry on (extending the mix uses them)
+    with _lock:
+        y, rep = post.mix_layers(layers, audio.SR)
+        raw = audio.resample(y, audio.SR, RAW_SR)
+        rid = new_id()
+        d = OUTPUT / rid
+        d.mkdir(parents=True)
+        po = master_opts(default_master(opt, base.get("bpm")), req)
+        rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "mix", "engine": base["engine"],
+               "model": "mix", "seeds": [0], "steps": None, "takes": [], "kind": base.get("kind", "music"),
+               "text": base.get("text", ""), "prompt": base["prompt"], "raw": bool(base.get("raw")),
+               "bpm": base.get("bpm"), "key": base.get("key"),
+               "name": (req.name or f"{base['name']}-mix")[:60], "layers": desc, "duration": rep["length_s"], "gen_length_s": rep["length_s"], "gen_s": 0.0, "post": po.asdict(),
+               "warnings": []}
+        path = d / "mix.wav"
+        audio.write_wav(path, raw, RAW_SR, subtype="FLOAT")
+        return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
 
 
 class MasterReq(MasterFields):

@@ -60,6 +60,13 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
 .part span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .part input { padding:3px 5px; font-size:12px; }
 .part button { padding:1px 7px; font-size:12px; }
+.part .mixrow { grid-column:1 / -1; display:grid; grid-template-columns:auto 1fr 52px auto 58px; gap:5px; align-items:center; }
+.part .mixrow input[type=range] { padding:0; }
+.part .vol { text-align:right; font-variant-numeric:tabular-nums; }
+.seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:4px 0 6px; }
+.seg button { flex:1; border:none; border-radius:0; padding:5px 4px; font-size:13px; }
+.seg button + button { border-left:1px solid var(--line); }
+.seg button.on { background:var(--acc); color:#fff; font-weight:600; }
 </style>
 </head>
 <body>
@@ -113,7 +120,11 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
   <button class="wide" id="importbtn" style="margin-top:6px">Import</button>
 
   <h2>Song</h2>
-  <div class="small" id="songempty">Add takes with <b>Add to song</b> on their cards; they're joined in this order, with new music written at each join.</div>
+  <div class="seg" id="songmode">
+    <button data-mode="join" title="One after another, with new music written at each join">Join in order</button>
+    <button data-mode="mix" title="On top of each other (a voice over a song), each at its own volume">Mix on top</button>
+  </div>
+  <div class="small" id="songempty">Add takes with <b>Add to song</b> on their cards. <b>Join</b> plays them one after another with new music written at each join; <b>Mix</b> plays them on top of each other, each at its own volume.</div>
   <div id="song"></div>
   <div class="row" id="songopts" hidden>
     <div><label for="bridge">Bridge (s)</label><input id="bridge" type="number" min="0" max="30" step="0.5" placeholder="2 bars" title="New music at each join. Empty: 2 bars at the first part's tempo. 0: the parts blend straight into each other."></div>
@@ -268,7 +279,8 @@ function card(res, t) {
 function show(res) {
   current = res;
   const what = (res.op || "generate") + (res.source ? " of " + res.source : "") +
-    (res.parts ? " of " + res.parts.length + " parts, bridges of " + res.bridge + " s" : "");
+    (res.parts ? " of " + res.parts.length + " parts, bridges of " + res.bridge + " s" : "") +
+    (res.layers ? " of " + res.layers.map(l => l.take.split(":")[1] + " " + dbText(l.gain_db) + (l.at ? " at " + l.at + " s" : "")).join(" + ") : "");
   const loopBars = el("input", {type: "number", min: "1", max: "64", value: (res.post && res.post.loop_bars) || 4, style: "width:70px"});
   const head = el("div", {class: "reqhead"},
     el("h2", {text: res.name}),
@@ -346,26 +358,44 @@ $("importbtn").addEventListener("click", async () => {
   finally { setBusy(false); }
 });
 
-// ---- the song: takes joined in order (kept in this browser between visits)
-let song = [];
-try { song = JSON.parse(localStorage.getItem("local-music-song") || "[]"); } catch (e) { song = []; }
-function saveSong() { try { localStorage.setItem("local-music-song", JSON.stringify(song)); } catch (e) { /* private window */ } }
-function addPart(ref, name, dur) { song.push({take: ref, name: name, dur: dur, span: ""}); saveSong(); drawSong(); }
+// ---- the song: takes joined in order, or mixed on top of each other (kept in this browser)
+let song = [], songMode = "join";
+try { song = JSON.parse(localStorage.getItem("local-music-song") || "[]"); songMode = localStorage.getItem("local-music-song-mode") || "join"; } catch (e) { song = []; }
+function saveSong() { try { localStorage.setItem("local-music-song", JSON.stringify(song)); localStorage.setItem("local-music-song-mode", songMode); } catch (e) { /* private window */ } }
+function addPart(ref, name, dur) { song.push({take: ref, name: name, dur: dur, span: "", gain: 0, at: 0}); saveSong(); drawSong(); }
+function dbText(v) { return (v > 0 ? "+" : "") + Number(v).toFixed(1) + " dB"; }
 function drawSong() {
-  const has = song.length > 0;
-  $("songempty").hidden = has; $("songopts").hidden = !has; $("bridgetext").hidden = !has; $("songbtns").hidden = !has;
+  const has = song.length > 0, mix = songMode === "mix";
+  document.querySelectorAll("#songmode button").forEach(b => b.classList.toggle("on", b.dataset.mode === songMode));
+  $("songempty").hidden = has; $("songbtns").hidden = !has;
+  $("songopts").hidden = !has || mix; $("bridgetext").hidden = !has || mix;
+  $("combine").textContent = mix ? "Mix" : "Combine";
   $("song").replaceChildren(...song.map((p, i) => {
+    if (p.gain == null) p.gain = 0;
+    if (p.at == null) p.at = 0;
     const span = el("input", {value: p.span, placeholder: "all" + (p.dur ? " (" + Math.round(p.dur) + " s)" : ""), title: "Use only START-END seconds of this take, e.g. 20-60, or 30- (from 30 s to the end). Empty: all of it."});
     span.addEventListener("input", () => { p.span = span.value; saveSong(); });
-    return el("div", {class: "part"},
+    const row = el("div", {class: "part"},
       el("span", {title: p.take, text: (i + 1) + ". " + p.name + " · " + p.take.split(":")[1]}), span,
-      el("button", {text: "↑", title: "Move earlier", onclick: () => { if (i > 0) { [song[i - 1], song[i]] = [song[i], song[i - 1]]; saveSong(); drawSong(); } }}),
+      el("button", {text: "↑", title: mix ? "Move up" : "Move earlier", onclick: () => { if (i > 0) { [song[i - 1], song[i]] = [song[i], song[i - 1]]; saveSong(); drawSong(); } }}),
       el("button", {text: "×", title: "Remove", onclick: () => { song.splice(i, 1); saveSong(); drawSong(); }}));
+    if (mix) {
+      const label = el("span", {class: "vol", text: dbText(p.gain)});
+      const vol = el("input", {type: "range", min: "-30", max: "6", step: "0.5", value: String(p.gain), title: "This layer's volume in the mix (0 dB: as delivered, at -14 LUFS)"});
+      vol.addEventListener("input", () => { p.gain = Number(vol.value); label.textContent = dbText(p.gain); saveSong(); });
+      vol.addEventListener("dblclick", () => { p.gain = 0; vol.value = "0"; label.textContent = dbText(0); saveSong(); });
+      const at = el("input", {type: "number", min: "0", step: "0.5", value: String(p.at), title: "Where this layer starts in the mix, in seconds"});
+      at.addEventListener("input", () => { p.at = Number(at.value) || 0; saveSong(); });
+      row.append(el("div", {class: "mixrow"}, el("span", {class: "small", text: "volume"}), vol, label, el("span", {class: "small", text: "at (s)"}), at));
+    }
+    return row;
   }));
 }
+document.querySelectorAll("#songmode button").forEach(b => b.addEventListener("click", () => { songMode = b.dataset.mode; saveSong(); drawSong(); }));
 $("songclear").addEventListener("click", () => { song = []; saveSong(); drawSong(); });
 $("combine").addEventListener("click", () => {
-  if (song.length < 2) { $("msg").textContent = "A song needs at least two parts."; return; }
+  const mix = songMode === "mix";
+  if (song.length < 2) { $("msg").textContent = mix ? "A mix needs at least two layers." : "A song needs at least two parts."; return; }
   const parts = [];
   for (const p of song) {
     const part = {take: p.take};
@@ -376,8 +406,10 @@ $("combine").addEventListener("click", () => {
       if (m[1]) part.start = Number(m[1]);
       if (m[2]) part.end = Number(m[2]);
     }
+    if (mix) { part.gain_db = p.gain || 0; part.at = p.at || 0; }
     parts.push(part);
   }
+  if (mix) { run("/api/mix", {layers: parts}, "Mixing"); return; }
   const b = {parts, n: num("n") || undefined};
   if (num("bridge") != null) b.bridge = num("bridge");
   if (num("blendin") != null) b.blend = num("blendin");

@@ -115,3 +115,13 @@ def test_cut_loop_crossfades_the_continuation_into_the_start():
 def test_options_are_validated(bad):
     with pytest.raises(ValueError):
         post.PostOpts(**bad)
+
+
+def test_mix_places_and_scales_layers():
+    sr = 1000
+    a = np.ones((2, 5 * sr), np.float32)
+    b = np.ones((1, 2 * sr), np.float32)
+    m, rep = post.mix_layers([post.Layer(a, gain_db=-6.0206), post.Layer(b, offset_s=4)], sr)
+    assert m.shape == (2, 6 * sr) and rep["length_s"] == 6.0
+    assert m[0, 100] == pytest.approx(0.5, abs=1e-3) and m[1, 4500] == pytest.approx(1.5, abs=1e-3)
+    assert m[0, 5500] == pytest.approx(1.0)

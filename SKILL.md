@@ -1,6 +1,6 @@
 ---
 name: local-music
-description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus; or start from the user's own audio file (continue it, restyle it), or join several takes into one song with bridges written between them. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
+description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus; or start from the user's own audio file (continue it, restyle it), or join several takes into one song with bridges written between them, or mix takes on top of each other (a voice over a song) at set volumes. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
 ---
 
 # local-music: instrumental music on the local GPU
@@ -112,6 +112,7 @@ $PY $M --master <request id> --no-loop --fade-out 5 --lufs -16
 $PY $M --import <file> "a slow acoustic folk song"            # the user's audio as a take (ref <id>:0)
 $PY $M "a warm music box melody" --vary <file> --strength 0.5    # files work directly too
 $PY $M "a big drum fill and a riser" --combine <intro ref> <main ref>@0-40 <outro ref>   # one song
+$PY $M --mix <song ref>,vol=-9 <voice ref>,at=4                 # a voice over a song (import the voice first)
 $PY $M --show-prompt "dark synthwave" --bpm 100                 # what the engine would get
 $PY $M --list          $PY $M --settings          $PY $M --engines
 ```
@@ -208,6 +209,10 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   straight into each other. Parts are cut to their body at the joins (fades and silence would
   make silent bridges); `REF@START-END` picks a span yourself. Read the result's PNG at each
   join: the bar grid should run through, the loudness shouldn't fall into a hole.
+- **A voice (or any layer) over a song**: `--import voice.mp3`, then `--mix <song ref>,vol=-9
+  <voice ref>,at=4`. Each layer is at the volume you give (default 0 dB, both at the same
+  loudness); nothing is ducked or levelled for you: the user decides the balance, so ask, or
+  offer two or three balances (song at -6 / -9 / -12) rather than picking one silently.
 
 ## 6. Delivering
 

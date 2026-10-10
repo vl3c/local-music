@@ -319,3 +319,28 @@ def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None 
         rep.update(m)
     rep["length_s"] = round(y.shape[1] / SR, 3)
     return y, rep
+
+
+# --------------------------------------------------------------------------- mixing layers
+
+@dataclass
+class Layer:
+    audio: np.ndarray        # (channels, n) at the mix's sample rate
+    gain_db: float = 0.0     # its volume in the mix
+    offset_s: float = 0.0    # where it starts in the mix
+
+
+def mix_layers(layers: list[Layer], sr: int) -> tuple[np.ndarray, dict]:
+    """Layers on top of each other, each at its volume and offset; as long as the longest.
+    Nothing is levelled or ducked: the volumes are the caller's. Unmastered (the caller
+    masters the sum). Returns (mix, report)."""
+    if not layers:
+        raise ValueError("nothing to mix")
+    starts = [int(round(ly.offset_s * sr)) for ly in layers]
+    n = max(s + as2d(ly.audio).shape[1] for s, ly in zip(starts, layers))
+    out = np.zeros((2, n), np.float32)
+    for s, ly in zip(starts, layers):
+        a = as2d(ly.audio)
+        a = np.vstack([a, a]) if a.shape[0] == 1 else a[:2]
+        out[:, s:s + a.shape[1]] += a * 10 ** (ly.gain_db / 20)
+    return out, {"length_s": round(n / sr, 3)}

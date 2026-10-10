@@ -341,3 +341,35 @@ def test_arrange_warns_about_a_tempo_change_and_checks_spans(client, server):
     assert any("BPM" in w and "change tempo" in w for w in res["warnings"])
     assert client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b, "start": 18}]}).status_code == 400
     assert client.post("/api/arrange", json={"parts": [{"take": a}]}).status_code == 422
+
+
+# ------------------------------------------------------------------ mixing
+
+def test_mix_puts_a_voice_over_the_music_at_set_volumes(client, server):
+    song = gen(client, n=1, duration=20, bpm=120)["takes"][0]["ref"]
+    voice_x = np.zeros((1, 6 * 48000), np.float32)
+    voice_x[0, 48000:4 * 48000] = 0.4 * np.sin(np.arange(3 * 48000) / 48000 * 2 * np.pi * 180)
+    voice = client.post("/api/import", params={"filename": "voice.wav"}, content=wav_bytes(voice_x, 48000)).json()
+    vref = voice["takes"][0]["ref"]
+    n_jobs = len(server._fake.jobs)
+    r = client.post("/api/mix", json={"layers": [{"take": song, "gain_db": -9}, {"take": vref, "at": 5}]})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    t = res["takes"][0]
+    assert res["op"] == "mix" and len(server._fake.jobs) == n_jobs  # nothing generated
+    assert [(ly["take"], ly["gain_db"], ly["at"]) for ly in res["layers"]] == [(song, -9, 0), (vref, 0, 5)]
+    assert t["signal"]["duration_s"] == pytest.approx(20.0, abs=0.05) and t["ref"].endswith(":0")
+    assert res["prompt"] == client.get(f"/api/requests/{song.split(':')[0]}").json()["prompt"]  # the first layer's
+    # The mix is a take like any other: it can be extended.
+    client.post("/api/extend", json={"take": t["ref"], "seconds": 10, "n": 1})
+    assert server._fake.jobs[-1]["inpaint_audio"].endswith("0_raw.wav")
+
+
+def test_mix_runs_as_long_as_its_longest_layer_and_validates(client):
+    a = gen(client, n=1, duration=10)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=8)["takes"][0]["ref"]
+    res = client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "at": 6, "start": 2}]}).json()
+    assert res["takes"][0]["signal"]["duration_s"] == pytest.approx(12.0, abs=0.1)
+    assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "start": 30}]}).status_code == 400
+    assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "gain_db": 40}]}).status_code == 422
+    assert client.post("/api/mix", json={"layers": [{"take": a}]}).status_code == 422

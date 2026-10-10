@@ -141,3 +141,14 @@ def test_audio_files_are_recognised(tmp_path):
     f.write_bytes(b"x")
     assert cli.is_audio_file(str(f)) and not cli.is_audio_file(str(tmp_path / "missing.wav"))
     assert not cli.is_audio_file("20261010-120000-abcd:5") and not cli.is_audio_file(None)
+
+
+def test_layers_for_mix():
+    ref = "20261010-120000-abcd:5"
+    assert cli.parse_layer(ref) == {"take": ref}
+    assert cli.parse_layer(f"{ref},vol=-8,at=4") == {"take": ref, "gain_db": -8.0, "at": 4.0}
+    assert cli.parse_layer(f"{ref}@10-40, vol=-6dB, at=2.5s") == {"take": ref, "start": 10.0, "end": 40.0,
+                                                                  "gain_db": -6.0, "at": 2.5}
+    for bad in (f"{ref},duck", f"{ref},vol=loud", "voice.mp3,vol=-3"):
+        with pytest.raises(ValueError):
+            cli.parse_layer(bad)

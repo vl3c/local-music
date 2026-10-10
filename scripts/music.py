@@ -13,6 +13,7 @@ The server must be running (start.cmd). Everything stays on 127.0.0.1.
     python scripts/music.py --import D:/audio/demo.mp3 "a slow acoustic folk song"    # your own audio, as a take
     python scripts/music.py --vary D:/audio/demo.mp3 "the same melody as a string quartet" --strength 0.5
     python scripts/music.py --combine A:1 B:7@20-60 C:3 --bridge 8                  # one song, bridged
+    python scripts/music.py --mix SONG:1,vol=-8 VOICE:0,at=4                         # a voice over a song
     python scripts/music.py --show-prompt "dark synthwave" --bpm 100
 
 A take is '<request id>:<seed>' (printed as `ref`); --extend, --vary and --inpaint also take
@@ -98,6 +99,24 @@ def parse_part(spec: str) -> dict:
         raise ValueError(f"a part is REQ:SEED or REQ:SEED@START-END (seconds), not {spec!r}")
     return given({"take": m["ref"], "start": float(m["a"]) if m["a"] else None,
                   "end": float(m["b"]) if m["b"] else None})
+
+
+def parse_layer(spec: str) -> dict:
+    """REF[@START-END][,vol=DB][,at=SECONDS]: a take (or a span of it) at a volume, starting at a time."""
+    head, *opts = [x.strip() for x in spec.split(",")]
+    layer = parse_part(head)
+    for o in opts:
+        k, _, v = o.partition("=")
+        try:
+            if k in ("vol", "gain"):
+                layer["gain_db"] = float(v.lower().removesuffix("db"))
+            elif k == "at":
+                layer["at"] = float(v.lower().removesuffix("s"))
+            else:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"layer option {o!r}: use vol=DB (e.g. vol=-8) or at=SECONDS (e.g. at=4)") from None
+    return layer
 
 
 def is_audio_file(arg: str | None) -> bool:
@@ -221,6 +240,9 @@ def describe(t: dict) -> str:
 
 def print_request(res: dict) -> None:
     what = res.get("op", "generate") + (f" of {res['source']}" if res.get("source") else "")
+    if res.get("layers"):
+        what += " of " + " + ".join(f"{ly['take']} {ly['gain_db']:+g} dB" + (f" at {ly['at']:g} s" if ly.get("at") else "")
+                                    for ly in res["layers"])
     if res.get("parts"):
         what += " of " + " + ".join(pt["take"] + (f"@{pt['start']:g}-{pt['end']:g}" if pt.get("start") else "")
                                     for pt in res["parts"]) + f" (bridges of {res.get('bridge', 0):g} s)"
@@ -307,6 +329,9 @@ def main() -> int:
                    "or 4 s without a tempo; 0 = blend the parts straight into each other)")
     s.add_argument("--blend", type=float, help="with --combine: seconds of each part regenerated beside a bridge "
                    "(default 1)")
+    s.add_argument("--mix", nargs="+", metavar="LAYER", help="takes on top of each other (a voice over a song): "
+                   "REF[@START-END][,vol=DB][,at=SECONDS]; each layer at its own volume (default 0 dB), "
+                   "starting at its time (default 0)")
     m = ap.add_argument_group("mastering (also with --master REQ)")
     m.add_argument("--length", type=float, help="cut the delivered track to this many seconds (with a fade)")
     m.add_argument("--full-length", action="store_true", help="with --master: undo an earlier --length")
@@ -342,12 +367,20 @@ def main() -> int:
 
     if a.seed is not None and a.seed.lower() != "random" and not a.seed.isdigit():
         ap.error("--seed takes a number or 'random'")
-    sources = [x for x in (a.extend, a.vary, a.inpaint, a.combine, a.import_file) if x]
+    sources = [x for x in (a.extend, a.vary, a.inpaint, a.combine, a.mix, a.import_file) if x]
     if len(sources) > 1:
-        ap.error("use one of --extend, --vary, --inpaint, --combine, --import at a time")
+        ap.error("use one of --extend, --vary, --inpaint, --combine, --mix, --import at a time")
     if not (a.text or sources or a.master or a.list or a.settings or a.engines or a.delete):
         ap.error("give the music to make, or --extend / --vary / --inpaint REF, --import FILE, --combine PARTS, "
-                 "--master REQ, --list, --settings, --engines or --delete")
+                 "--mix LAYERS, --master REQ, --list, --settings, --engines or --delete")
+    layers = None
+    if a.mix:
+        if len(a.mix) < 2:
+            ap.error("--mix needs at least two layers")
+        try:
+            layers = [parse_layer(x) for x in a.mix]
+        except ValueError as exc:
+            ap.error(str(exc))
     if a.import_file is not None and not a.import_file.is_file():
         ap.error(f"--import: no file {a.import_file}")
     parts = None
@@ -415,6 +448,8 @@ def main() -> int:
     text = {"text": a.text} if a.text else {}
     if a.import_file is not None:
         res = upload(a.import_file, a.text, a.name, a.check)
+    elif a.mix:
+        res = call("/api/mix", {"layers": layers, **master_fields(a), **given({"name": a.name, "check": a.check})})
     elif a.combine:
         res = call("/api/arrange", {"parts": parts, **text, **shape_fields(a), **master_fields(a),
                                     **given({"bridge": a.bridge, "blend": a.blend, "name": a.name})})

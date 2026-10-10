@@ -5,8 +5,8 @@ call. Describe the music (genre, instruments, mood, tempo, key) and get back mas
 tracks: checked, scored and ranked best-of-N, as 48 kHz WAVs and MP3s, with a waveform,
 loudness and spectrogram picture of each so an agent that can't listen can still judge them.
 Continue a track, make variations, redo a section, or cut a seamless loop on the bar; start
-from your own audio file; or join several takes into one song, with new music written at
-each join.
+from your own audio file; join several takes into one song, with new music written at each
+join; or mix takes on top of each other (a voice over a song), each at its own volume.
 
 It runs **Stable Audio 3 Medium**, the best open-weights model on the
 [Artificial Analysis instrumental leaderboard](https://artificialanalysis.ai/music/leaderboard/instrumental)
@@ -103,6 +103,18 @@ What you may do with someone else's recording is up to its licence: the tool doe
 Measured: Windows' `Alarm01.wav` (5.6 s) extended by 40 s as "an upbeat tropical house track
 built around a bright marimba melody" came back as music (CE 7.4, PQ 8.4); varied at 0.5 as
 "a warm music box melody", its CLAP match to that description rose from 0.37 to 0.45.
+
+### Mixing takes on top of each other
+
+`--mix SONG:1,vol=-8 VOICE:0,at=4` (or **Mix on top** in the page's Song tray) layers takes: each
+is the take's delivered track (what you hear: mastered, or its loop), at its own volume
+(`vol=`, dB, default 0) starting at its own time (`at=`, seconds, default 0), optionally a span
+(`REF@10-40`). The mix runs as long as its longest layer. Nothing levels or ducks the layers:
+the balance is yours. The sum is mastered like any take (so the overall loudness is the usual
+-14 LUFS and the volumes set the balance between layers), and it's a take itself: extend it,
+loop it, re-master it, or mix it again. A voice is usually imported first (`--import
+voice.mp3`); at 0 dB both layers sit at the same loudness, so a voice over a busy song
+typically wants the song at -6 to -12.
 
 ### Joining takes into one song
 
@@ -230,6 +242,7 @@ python scripts\music.py --settings
 | `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take, or an audio file (above). |
 | `--import FILE` | Your own audio as a take; the text describes it. |
 | `--combine PART PART...`, `--bridge S`, `--blend S` | Join takes into one song; parts are `REF` or `REF@START-END`. Put the text before `--combine`. |
+| `--mix LAYER LAYER...` | Takes on top of each other: `REF[@START-END][,vol=DB][,at=SECONDS]`. |
 | `--master REQ` | Re-master a request with the mastering flags; `--no-loop`, `--full-length` undo a loop or a cut. |
 | `--out DIR` | Copy the best take (`--best N`, `--all`) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
 | `--play`, `--no-save`, `--json`, `--wait S` | Play the best take; delete the request afterwards; print the server's JSON; wait for the server. |
@@ -256,6 +269,7 @@ full output goes to `logs\server.log`, timestamped. Each start keeps the previou
 | `POST /api/vary` | `{"take", "strength"?, "text"?, ...}` | variations |
 | `POST /api/inpaint` | `{"take", "start", "end", "text"?, ...}` | the take with that span redone |
 | `POST /api/import?filename=&text=&kind=&name=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
+| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?}, ...], "name"?, + mastering}` | the mix, as one take (seed 0) |
 | `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
 | `POST /api/master` | `{"request", "length"?, "fade_in"?, "fade_out"?, "lufs"?, "peak_dbtp"?, "loop_bars"?, "beats_per_bar"?, "bpm"?}` | the request, re-mastered (`null` clears `length` / `loop_bars`) |
 | `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>` | | list, one, delete |
@@ -286,8 +300,9 @@ http://127.0.0.1:8192/ does the same: the description, seconds, BPM, key and kin
 mastering and fine-tuning folded away, then one card per take with its scores, tempo and key,
 player, picture, downloads, **Add to song**, and **Extend / Vary / Inpaint**; per request,
 **Re-master**, **Make loops** and **delete**. On the left, **Start from your own audio** imports
-a file, and **Song** lists the takes you added (reorder, trim each to a span, set the bridge)
-for **Combine**. `Ctrl+Enter` generates.
+a file, and **Song** lists the takes you added: **Join in order** (reorder, trim each to a
+span, set the bridge, **Combine**) or **Mix on top** (a volume slider and a start time per
+layer, double-click a slider for 0 dB, **Mix**). `Ctrl+Enter` generates.
 
 ### Speed (RTX 5080)
 
