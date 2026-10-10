@@ -15,6 +15,8 @@ The server must be running (start.cmd). Everything stays on 127.0.0.1.
     python scripts/music.py --combine A:1 B:7@20-60 C:3 --bridge 8                  # one song, bridged
     python scripts/music.py --mix SONG:1,vol=-8 VOICE:0,at=4                         # a voice over a song
     python scripts/music.py --show-prompt "dark synthwave" --bpm 100
+    python scripts/music.py --show 20261010-120000-ab12                             # an earlier request's takes
+    python scripts/music.py --save-defaults --n 6 --lufs -16                         # your defaults (page and API too)
 
 A take is '<request id>:<seed>' (printed as `ref`); --extend, --vary and --inpaint also take
 an audio file, which is imported first. Delivered files are named after the
@@ -71,9 +73,10 @@ def call(path: str, payload: dict | None = None, timeout: float = 3600, method: 
         sys.exit(1)
 
 
-def upload(path: Path, text: str | None = None, name: str | None = None, check: bool | None = None) -> dict:
+def upload(path: Path, text: str | None = None, name: str | None = None, check: bool | None = None,
+           kind: str | None = None) -> dict:
     """POST an audio file's bytes to /api/import: it comes back as a request with one take (seed 0)."""
-    q = urllib.parse.urlencode(given({"filename": path.name, "text": text, "name": name,
+    q = urllib.parse.urlencode(given({"filename": path.name, "text": text, "name": name, "kind": kind,
                                       "check": None if check is None else str(check).lower()}))
     req = urllib.request.Request(f"{SERVER}/api/import?{q}", data=path.read_bytes(),
                                  headers={"Content-Type": "application/octet-stream"}, method="POST")
@@ -349,7 +352,12 @@ def main() -> int:
     o.add_argument("--master", metavar="REQ", help="re-master a request's takes with the options above; no regeneration")
     o.add_argument("--show-prompt", action="store_true", help="print the prompt the engine would get, and exit")
     o.add_argument("--list", action="store_true", help="recent requests")
+    o.add_argument("--show", metavar="REQ", help="an earlier request: its prompt and ranked takes, with their files")
     o.add_argument("--settings", action="store_true", help="show the defaults in effect")
+    o.add_argument("--save-defaults", action="store_true", help="save the given --n, --duration, --engine, --steps, "
+                   "--seed, --raw/--no-check, --lufs, --peak, --fade-in, --fade-out, --strength as your defaults "
+                   "(config.local.json; the page and the API use them too); others stay as saved")
+    o.add_argument("--reset-defaults", action="store_true", help="forget your saved defaults: back to the built-in ones")
     o.add_argument("--engines", action="store_true", help="engines: installed / running")
     o.add_argument("--delete", metavar="REQ", help="delete a request's files from output/")
     d = ap.add_argument_group("delivery")
@@ -371,9 +379,11 @@ def main() -> int:
     sources = [x for x in (a.extend, a.vary, a.inpaint, a.combine, a.mix, a.import_file) if x]
     if len(sources) > 1:
         ap.error("use one of --extend, --vary, --inpaint, --combine, --mix, --import at a time")
-    if not (a.text or sources or a.master or a.list or a.settings or a.engines or a.delete):
+    if not (a.text or sources or a.master or a.list or a.show or a.settings or a.save_defaults or a.reset_defaults
+            or a.engines or a.delete):
         ap.error("give the music to make, or --extend / --vary / --inpaint REF, --import FILE, --combine PARTS, "
-                 "--mix LAYERS, --master REQ, --list, --settings, --engines or --delete")
+                 "--mix LAYERS, --master REQ, --list, --show REQ, --settings, --save-defaults, --reset-defaults, "
+                 "--engines or --delete")
     layers = None
     if a.mix:
         if len(a.mix) < 2:
@@ -405,6 +415,21 @@ def main() -> int:
         print(f"No server at {SERVER}. Start it with start.cmd (agents: start.cmd --no-browser).", file=sys.stderr)
         return 1
 
+    if a.reset_defaults:
+        call("/api/settings", method="DELETE")
+        print("saved defaults forgotten: the built-in ones apply")
+        a.settings = True
+    if a.save_defaults:
+        new = given({"n": a.n, "duration": a.duration, "engine": a.engine, "steps": a.steps, "raw": a.raw,
+                     "check": a.check, "lufs": a.lufs, "peak_dbtp": a.peak, "fade_in": a.fade_in,
+                     "fade_out": a.fade_out, "strength": a.strength})
+        if a.seed is not None:
+            new["seed"] = None if a.seed.lower() == "random" else int(a.seed)
+        if not new:
+            ap.error("--save-defaults saves the options given with it, e.g. --save-defaults --n 6 --lufs -16")
+        call("/api/settings", {**call("/api/settings")["saved"], **new})
+        print("saved: " + ", ".join(f"{k} {v}" for k, v in new.items()))
+        a.settings = True
     if a.settings:
         st = call("/api/settings")
         print("in effect: " + (f"your saved defaults ({st['file']}) over the built-in ones" if st["file"]
@@ -417,6 +442,13 @@ def main() -> int:
         for k, e in call("/api/engines").items():
             print(f"{k:7s} {e['label']:28s} {'installed' if e['installed'] else 'NOT installed'}"
                   f"{', running' if e['running'] else ''}")
+        return 0
+    if a.show:
+        res = call(f"/api/requests/{a.show}")
+        if a.json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print_request(res)
         return 0
     if a.list:
         for r in call("/api/requests?limit=30"):
@@ -452,7 +484,7 @@ def main() -> int:
 
     text = {"text": a.text} if a.text else {}
     if a.import_file is not None:
-        res = upload(a.import_file, a.text, a.name, a.check)
+        res = upload(a.import_file, a.text, a.name, a.check, "stem" if a.stem else None)
     elif a.mix:
         res = call("/api/mix", {"layers": layers, **master_fields(a), **given({"name": a.name, "check": a.check})})
     elif a.combine:

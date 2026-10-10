@@ -98,7 +98,7 @@ meet. Tests check this sample for sample. A vary is the exception by nature: it'
 
 ### Your own audio
 
-`--import FILE ["what it is"]` (or **Start from your own audio** on the page) turns a WAV, FLAC,
+`--import FILE ["what it is"]` (`--stem` if it's one instrument; or **Start from your own audio** on the page) turns a WAV, FLAC,
 OGG or MP3 into a take of an `import` request (seed 0): checked, measured and mastered like a
 generated one, nothing generated. Everything above works from its ref: extend it into a longer
 piece, vary it (timbre or style transfer: a melody played on another instrument at strength
@@ -252,7 +252,8 @@ python scripts\music.py --settings
 | `--master REQ` | Re-master a request with the mastering flags; `--no-loop`, `--full-length` undo a loop or a cut. |
 | `--out DIR` | Copy the best take (`--best N`, `--all`) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
 | `--play`, `--no-save`, `--json`, `--wait S` | Play the best take; delete the request afterwards; print the server's JSON; wait for the server. |
-| `--show-prompt`, `--list`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up. |
+| `--show-prompt`, `--list`, `--show REQ`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up (`--show`: an earlier request's takes and files). |
+| `--save-defaults` / `--reset-defaults` | Save the options given with it (`--n`, `--duration`, `--lufs`, `--fade-out`...) as your defaults, merged with what's saved; or forget them. The page's **Save as my defaults** does the same. |
 
 A take's **ref** is `<request id>:<seed>`. Exit codes: 0 done, 1 no server or failed, 2 bad
 arguments, 3 every take was rejected.

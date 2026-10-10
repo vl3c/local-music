@@ -114,7 +114,8 @@ $PY $M "a warm music box melody" --vary <file> --strength 0.5    # files work di
 $PY $M "a big drum fill and a riser" --combine <intro ref> <main ref>@0-40 <outro ref>   # one song
 $PY $M --mix <song ref>,vol=-9 <voice ref>,at=4                 # a voice over a song (import the voice first)
 $PY $M --show-prompt "dark synthwave" --bpm 100                 # what the engine would get
-$PY $M --list          $PY $M --settings          $PY $M --engines
+$PY $M --list          $PY $M --show <request id>          $PY $M --settings          $PY $M --engines
+$PY $M --save-defaults --n 6 --lufs -16       # only when the user asks for new defaults; --reset-defaults undoes
 ```
 
 A **ref** is `<request id>:<seed>`, printed for every take. `--json` prints the server's full

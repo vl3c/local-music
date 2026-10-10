@@ -5,13 +5,13 @@ and SHA256, so an upstream re-upload fails loudly instead of silently changing w
 Downloads resume. Files you already have are reused instead of downloaded: from another
 install (--reuse <its models folder>) or from your Hugging Face cache, hard-linked when on
 the same drive (no extra space) or copied, then verified like any download. A reused file
-may sit under any model folder of the other install: local-sounds keeps the same T5Gemma
-text encoder under sa3-small-sfx/, and the checksum decides whether it is the same file.
+may sit under any model folder of the other install (another Stable Audio 3 model's folder
+carries the same T5Gemma text encoder): the checksum decides whether it is the same file.
 
     python scripts/download_models.py                    # everything not marked optional
     python scripts/download_models.py --only sa3-small-music   # one repo, by name
     python scripts/download_models.py --verify           # check what's there, download nothing
-    python scripts/download_models.py --reuse ../local-sounds/models
+    python scripts/download_models.py --reuse ../some-other-install/models
 
 Gated repos (Stable Audio 3): accept the licence on the model's Hugging Face page and run
 `hf auth login` yourself first. This script never reads, prints or stores your token: the

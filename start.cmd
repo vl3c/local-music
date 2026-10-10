@@ -9,7 +9,7 @@ rem   start.cmd --lazy          load nothing until the first request (the page c
 rem                             seconds; the first track then waits ~40 s for the engine)
 rem
 rem The server only ever runs in that window, so it can't be left running out of sight: it
-rem refuses to start anywhere else (a hidden background shell, python serverpp.py).
+rem refuses to start anywhere else (a hidden background shell, python server\app.py).
 setlocal
 cd /d "%~dp0"
 rem Captured before the option loop: it shifts the arguments (shift /1 leaves %0 alone,
