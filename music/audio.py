@@ -103,9 +103,10 @@ def write_wav(path: Path | str, x: np.ndarray, sr: int = SR, info: dict[str, str
               subtype: str = "PCM_24") -> Path:
     """Write a WAV (24-bit PCM by default) with an INFO chunk placed before the audio data.
 
-    The audio is clamped to [-1, 1] first: the integer formats would wrap around otherwise.
+    Integer formats are clamped to [-1, 1] first (they would wrap around otherwise); FLOAT keeps
+    every value, so a raw take's peaks over full scale survive until mastering.
     """
-    x = np.clip(as2d(x), -1.0, 1.0)
+    x = as2d(x) if subtype == "FLOAT" else np.clip(as2d(x), -1.0, 1.0)
     buf = io.BytesIO()
     sf.write(buf, x.T, sr, format="WAV", subtype=subtype)
     chunks = [(c, d) for c, d in _chunks(buf.getvalue()) if c != b"LIST"]

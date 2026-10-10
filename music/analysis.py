@@ -47,6 +47,23 @@ def ending(x: np.ndarray, sr: int, window_s: float = 0.5) -> dict:
     return {"end_db": round(end - level, 1), "tail_s": round((len(env) - 1 - last) * HOP_S, 2)}
 
 
+def body(x: np.ndarray, sr: int, below_db: float = 10.0, smooth_s: float = 0.4) -> tuple[int, int]:
+    """(start, end) samples of the music's body: from the first to the last moment its level
+    (smoothed over smooth_s) is within below_db of its own median. Leading silence and a
+    fade-in fall before it; an ending (a fade, a final chord dying away, the silence after)
+    falls after it. A piece that starts or ends at full strength keeps that edge."""
+    env = envelope_db(x, sr)
+    k = max(1, int(smooth_s / HOP_S))
+    p = np.convolve(10 ** (env / 10), np.ones(k) / k, mode="same")
+    lvl = 10 * np.log10(p + 1e-20)
+    on = np.nonzero(lvl >= float(np.median(lvl)) - below_db)[0]
+    n = as2d(x).shape[1]
+    if not len(on):
+        return 0, n
+    hop = max(1, int(round(HOP_S * sr)))
+    return int(on[0]) * hop, min(n, (int(on[-1]) + 1) * hop)
+
+
 def true_peak_db(x: np.ndarray, sr: int) -> float:
     """ITU-R BS.1770-style true peak: the sample peak after 4x oversampling (dBTP)."""
     x = as2d(x)

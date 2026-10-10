@@ -97,3 +97,16 @@ def test_loudness_matches_pyloudnorm(seconds, stereo):
     ref_in = x if x.shape[1] >= int(0.4 * SR) + 1 else np.tile(x, (1, int(0.4 * SR) // x.shape[1] + 2))
     ref = pyloudnorm.Meter(SR).integrated_loudness(ref_in.T.astype(np.float64))
     assert want == pytest.approx(ref, abs=0.02)
+
+
+def test_body_leaves_out_a_fade_in_an_ending_and_silence():
+    x = band(120, 30.0)
+    n = x.shape[1]
+    shaped = x.copy()
+    shaped[:, :3 * SR] *= np.linspace(0, 1, 3 * SR) ** 2            # 3 s fade-in
+    shaped[:, n - 6 * SR:] *= np.linspace(1, 0, 6 * SR) ** 3          # a 6 s ending
+    shaped = np.concatenate([shaped, np.zeros((2, 2 * SR), np.float32)], axis=1)  # then silence
+    a, b = analysis.body(shaped, SR)
+    assert 0.5 * SR < a < 3 * SR and n - 6 * SR < b < n - 2 * SR
+    a2, b2 = analysis.body(x, SR)  # full strength edge to edge: keeps them
+    assert a2 < 0.1 * SR and b2 > n - 0.6 * SR

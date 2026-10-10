@@ -10,9 +10,13 @@ The server must be running (start.cmd). Everything stays on 127.0.0.1.
     python scripts/music.py --vary 20261010-120000-ab12:1234 --strength 0.3        # a variation
     python scripts/music.py --inpaint 20261010-120000-ab12:1234 --span 20-28 "a drum fill"
     python scripts/music.py --master 20261010-120000-ab12 --fade-out 4 --lufs -16  # re-master, no regeneration
+    python scripts/music.py --import D:/audio/demo.mp3 "a slow acoustic folk song"    # your own audio, as a take
+    python scripts/music.py --vary D:/audio/demo.mp3 "the same melody as a string quartet" --strength 0.5
+    python scripts/music.py --combine A:1 B:7@20-60 C:3 --bridge 8                  # one song, bridged
     python scripts/music.py --show-prompt "dark synthwave" --bpm 100
 
-A take is '<request id>:<seed>' (printed as `ref`). Delivered files are named after the
+A take is '<request id>:<seed>' (printed as `ref`); --extend, --vary and --inpaint also take
+an audio file, which is imported first. Delivered files are named after the
 request (warm-lofi-hip-hop_v01.wav, .mp3 and a .json sidecar) and never overwrite anything.
 
 Exit status: 0 done, 1 failed or no server, 2 bad arguments, 3 every take was rejected.
@@ -40,6 +44,8 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 OUTPUT = Path(__file__).resolve().parent.parent / "output"
 NAME = re.compile(r"^[A-Za-z0-9-]+$")
 SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+PART = re.compile(r"^(?P<ref>[0-9]{8}-[0-9]{6}-[0-9a-f]{4}:[0-9]+)(?:@(?P<a>\d+(?:\.\d+)?)?-(?P<b>\d+(?:\.\d+)?)?)?$")
+AUDIO_EXT = (".wav", ".flac", ".ogg", ".mp3")
 
 
 def call(path: str, payload: dict | None = None, timeout: float = 3600, method: str | None = None):
@@ -62,6 +68,40 @@ def call(path: str, payload: dict | None = None, timeout: float = 3600, method: 
         # Refused, reset or timed out: the server is down, restarting or was stopped mid-request.
         print(f"lost the server at {SERVER}: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def upload(path: Path, text: str | None = None, name: str | None = None, check: bool | None = None) -> dict:
+    """POST an audio file's bytes to /api/import: it comes back as a request with one take (seed 0)."""
+    q = urllib.parse.urlencode(given({"filename": path.name, "text": text, "name": name,
+                                      "check": None if check is None else str(check).lower()}))
+    req = urllib.request.Request(f"{SERVER}/api/import?{q}", data=path.read_bytes(),
+                                 headers={"Content-Type": "application/octet-stream"}, method="POST")
+    try:
+        with _OPENER.open(req, timeout=600) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.load(exc).get("detail")
+        except Exception:
+            detail = exc.reason
+        print(f"server said {exc.code}: {detail}", file=sys.stderr)
+        sys.exit(2 if exc.code in (400, 404, 413, 422) else 1)
+    except (OSError, http.client.HTTPException) as exc:
+        print(f"lost the server at {SERVER}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_part(spec: str) -> dict:
+    """REF or REF@START-END (either end may be left out: REF@30- is from 30 s to the end)."""
+    m = PART.fullmatch(spec.strip())
+    if not m:
+        raise ValueError(f"a part is REQ:SEED or REQ:SEED@START-END (seconds), not {spec!r}")
+    return given({"take": m["ref"], "start": float(m["a"]) if m["a"] else None,
+                  "end": float(m["b"]) if m["b"] else None})
+
+
+def is_audio_file(arg: str | None) -> bool:
+    return bool(arg) and arg.lower().endswith(AUDIO_EXT) and Path(arg).is_file()
 
 
 def wait_for_server(seconds: float) -> bool:
@@ -181,6 +221,9 @@ def describe(t: dict) -> str:
 
 def print_request(res: dict) -> None:
     what = res.get("op", "generate") + (f" of {res['source']}" if res.get("source") else "")
+    if res.get("parts"):
+        what += " of " + " + ".join(pt["take"] + (f"@{pt['start']:g}-{pt['end']:g}" if pt.get("start") else "")
+                                    for pt in res["parts"]) + f" (bridges of {res.get('bridge', 0):g} s)"
     print(f"request {res['id']}  {what}  {res.get('engine')}  {res.get('name')}")
     if res.get("prompt"):
         print(f"prompt:   {res['prompt']}")
@@ -248,13 +291,22 @@ def main() -> int:
                    help="CLAP + Audiobox Aesthetics scores (default on)")
     g.add_argument("--no-check", dest="check", action="store_false", help="skip the model scores (the signal, "
                    "tempo and key checks still run)")
-    s = ap.add_argument_group("from an earlier take (REF is REQ:SEED)")
+    s = ap.add_argument_group("from earlier takes or your own audio (REF is REQ:SEED)")
     s.add_argument("--extend", metavar="REF", help="continue the take: the result is the whole track, longer")
     s.add_argument("--seconds", type=float, help="with --extend: how much new music (default 30)")
     s.add_argument("--vary", metavar="REF", help="a variation of the take (audio to audio)")
     s.add_argument("--strength", type=float, help="with --vary: 0.05 (nearly the same) .. 1 (unrelated); default 0.5")
     s.add_argument("--inpaint", metavar="REF", help="regenerate a span of the take, keep the rest")
     s.add_argument("--span", help="with --inpaint: START-END in seconds, e.g. 20-28")
+    s.add_argument("--import", dest="import_file", metavar="FILE", type=Path,
+                   help="your own audio (WAV, FLAC, OGG, MP3) as a take; the text describes it. --extend, --vary "
+                        "and --inpaint also take a file directly")
+    s.add_argument("--combine", nargs="+", metavar="PART", help="takes in order as one song, with a bridge written "
+                   "between each two: REF or REF@START-END; the text describes the bridges")
+    s.add_argument("--bridge", type=float, help="with --combine: seconds of new music at each join (default 2 bars, "
+                   "or 4 s without a tempo; 0 = blend the parts straight into each other)")
+    s.add_argument("--blend", type=float, help="with --combine: seconds of each part regenerated beside a bridge "
+                   "(default 1)")
     m = ap.add_argument_group("mastering (also with --master REQ)")
     m.add_argument("--length", type=float, help="cut the delivered track to this many seconds (with a fade)")
     m.add_argument("--full-length", action="store_true", help="with --master: undo an earlier --length")
@@ -290,12 +342,22 @@ def main() -> int:
 
     if a.seed is not None and a.seed.lower() != "random" and not a.seed.isdigit():
         ap.error("--seed takes a number or 'random'")
-    sources = [x for x in (a.extend, a.vary, a.inpaint) if x]
+    sources = [x for x in (a.extend, a.vary, a.inpaint, a.combine, a.import_file) if x]
     if len(sources) > 1:
-        ap.error("use one of --extend, --vary, --inpaint at a time")
+        ap.error("use one of --extend, --vary, --inpaint, --combine, --import at a time")
     if not (a.text or sources or a.master or a.list or a.settings or a.engines or a.delete):
-        ap.error("give the music to make, or --extend / --vary / --inpaint REF, --master REQ, --list, "
-                 "--settings, --engines or --delete")
+        ap.error("give the music to make, or --extend / --vary / --inpaint REF, --import FILE, --combine PARTS, "
+                 "--master REQ, --list, --settings, --engines or --delete")
+    if a.import_file is not None and not a.import_file.is_file():
+        ap.error(f"--import: no file {a.import_file}")
+    parts = None
+    if a.combine:
+        if len(a.combine) < 2:
+            ap.error("--combine needs at least two parts")
+        try:
+            parts = [parse_part(x) for x in a.combine]
+        except ValueError as exc:
+            ap.error(str(exc))
     if a.inpaint and not a.span:
         ap.error("--inpaint needs --span START-END (seconds)")
     span = None
@@ -338,8 +400,25 @@ def main() -> int:
         print(json.dumps(r, indent=2) if a.json else f"prompt: {r['prompt']}\nfile:   {r['name']}_v01.wav")
         return 0
 
+    # An audio file given to --extend / --vary / --inpaint is imported first (undescribed: the
+    # text, if any, is the prompt for the new music, not a description of the file).
+    for attr in ("extend", "vary", "inpaint"):
+        val = getattr(a, attr)
+        if val and not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}[:#/][0-9]+", val):
+            if not is_audio_file(val):
+                ap.error(f"--{attr} takes a take's ref (REQ:SEED) or an audio file (WAV, FLAC, OGG, MP3), not {val!r}")
+            imp = upload(Path(val), check=False)
+            if not a.json:
+                print(f"imported {val} as {imp['takes'][0]['ref']}")
+            setattr(a, attr, imp["takes"][0]["ref"])
+
     text = {"text": a.text} if a.text else {}
-    if a.master:
+    if a.import_file is not None:
+        res = upload(a.import_file, a.text, a.name, a.check)
+    elif a.combine:
+        res = call("/api/arrange", {"parts": parts, **text, **shape_fields(a), **master_fields(a),
+                                    **given({"bridge": a.bridge, "blend": a.blend, "name": a.name})})
+    elif a.master:
         res = call("/api/master", {"request": a.master, **master_fields(a), **given({"bpm": a.bpm, "check": a.check})})
     elif a.extend:
         res = call("/api/extend", {"take": a.extend, **text, **shape_fields(a), **master_fields(a),

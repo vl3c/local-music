@@ -16,14 +16,17 @@ rejects the broken ones and returns them all ranked. Its files live in output/<i
     <seed>.png           waveform, loudness and spectrogram with the bar grid
 
 Kinds of request: generate (text to music), extend (continue a take), vary (a variation
-of a take: audio to audio) and inpaint (regenerate a span of a take). /api/master re-masters
-a request's takes (length, fades, loudness, loop) without regenerating.
+of a take: audio to audio), inpaint (regenerate a span of a take), import (your own audio
+file, as a take the others can start from) and arrange (several takes in order, with a bridge
+written between each two). /api/master re-masters a request's takes (length, fades,
+loudness, loop) without regenerating.
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import io
 import json
 import os
 import queue
@@ -54,9 +57,10 @@ for _k, _v in {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISAB
     os.environ[_k] = _v
 
 import uvicorn  # noqa: E402
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
 import serverlog  # noqa: E402  (server/, on sys.path as the script's folder)
@@ -534,7 +538,10 @@ def judge(rec: dict, takes: list[dict], finals: list[np.ndarray], check: bool) -
     if check:
         try:
             # An inpainted take is mostly its source: judge it against the source's description.
-            cl = clap().score(finals, audio.SR, prompts.describe(rec.get("clap_prompt") or rec["prompt"]))
+            # Nothing to match without one (an imported track nobody described).
+            text = prompts.describe(rec.get("clap_prompt") or rec["prompt"]) if (rec.get("clap_prompt") or
+                                                                                rec["prompt"]) else ""
+            cl = clap().score(finals, audio.SR, text) if text else [{} for _ in finals]
             ae = aes().score(finals, audio.SR)
             for t, c, a in zip(takes, cl, ae):
                 t.update(c)
@@ -587,8 +594,8 @@ def take_view(rec: dict, take: dict) -> dict:
 
 def request_view(rec: dict) -> dict:
     keep = ("id", "created", "op", "kind", "text", "prompt", "negative", "raw", "bpm", "key", "name", "engine",
-            "model", "seeds", "steps", "duration", "source", "seconds", "strength", "span", "post",
-            "gen_length_s", "gen_s", "score_s", "warnings")
+            "model", "seeds", "steps", "duration", "source", "seconds", "strength", "span", "parts", "bridge",
+            "blend", "post", "gen_length_s", "gen_s", "score_s", "warnings")
     out = {k: rec[k] for k in keep if k in rec}
     out["takes"] = [take_view(rec, t) for t in rec["takes"]]
     out["kept"] = sum(not t.get("rejected") for t in rec["takes"])
@@ -612,21 +619,32 @@ def _start(engine: str) -> Worker:
         raise HTTPException(503, f"engine {engine} failed to start: {exc} (see logs/server.log)") from exc
 
 
+def _call(rec: dict, job: dict, w: Worker) -> dict:
+    """Send one job to the engine. On failure the request's folder goes and it's a 500."""
+    try:
+        return w.call(job)
+    except Exception as exc:
+        shutil.rmtree(req_dir(rec["id"]), ignore_errors=True)
+        print(f"[local-music] generation FAILED: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(500, f"generation failed: {type(exc).__name__}: {exc}") from exc
+
+
 def _run(rec: dict, job: dict, w: Worker, opt: dict, stitch=None) -> dict:
     """Send the job, turn the worker's files into checked, mastered, ranked takes. Call with _lock held.
 
     stitch(raw) -> raw: for extensions longer than the engine's window, puts the earlier part
     of the source back in front of what the engine returned.
     """
-    d = req_dir(rec["id"])
     t0 = time.time()
-    try:
-        reply = w.call(job)
-    except Exception as exc:
-        shutil.rmtree(d, ignore_errors=True)
-        print(f"[local-music] generation FAILED: {type(exc).__name__}: {exc}", flush=True)
-        raise HTTPException(500, f"generation failed: {type(exc).__name__}: {exc}") from exc
+    reply = _call(rec, job, w)
     rec["gen_s"] = round(time.time() - t0, 2)
+    return _finish(rec, reply, opt, stitch)
+
+
+def _finish(rec: dict, reply: dict, opt: dict, stitch=None) -> dict:
+    """The engine's files ({"files": [{"seed", "path"}]}) -> checked, mastered, ranked takes,
+    saved; the request as the API returns it. Call with _lock held."""
+    d = req_dir(rec["id"])
     try:
         t1 = time.time()
         opts = post.PostOpts(**rec["post"])
@@ -814,6 +832,218 @@ def inpaint(req: InpaintReq):
                "out_dir": str(req_dir(rec["id"])), "stem": "gen", "inpaint_audio": str(raw_path),
                "mask_start": req.start, "mask_end": req.end}
         return _run(rec, job, w, opt)
+
+
+# --------------------------------------------------------------------------- your own audio
+
+MAX_IMPORT_BYTES = 300 * 2**20
+MAX_IMPORT_S = 1200.0
+
+
+@app.post("/api/import")
+async def import_audio(request: Request, filename: str = Query(min_length=1, max_length=200),
+                       text: str | None = Query(None, max_length=1000), kind: Literal["music", "stem"] = "music",
+                       name: str | None = Query(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$"),
+                       check: bool | None = None):
+    """Your own audio file (the request body, as raw bytes: WAV, FLAC, OGG or MP3) becomes a
+    take (seed 0) of an "import" request: checked, measured and mastered like any other, so
+    extend, vary, inpaint, arrange and master all work from its ref. `text` describes it
+    (it becomes the prompt that work continues from; without it the engine is led by the
+    audio alone)."""
+    size = int(request.headers.get("content-length") or 0)
+    if size > MAX_IMPORT_BYTES:
+        raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "no audio in the request body")
+    if len(data) > MAX_IMPORT_BYTES:
+        raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
+    return await run_in_threadpool(_import, data, filename, text, kind, name, check)
+
+
+def _import(data: bytes, filename: str, text: str | None, kind: str, name: str | None, check: bool | None) -> dict:
+    import soundfile as sf
+    base = Path(filename.replace("\\", "/")).name or "audio"
+    try:
+        x, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    except Exception as exc:
+        raise HTTPException(400, f"can't read {base!r} as audio ({exc}). WAV, FLAC, OGG and MP3 work; "
+                                 "convert other formats (M4A, AAC...) first") from exc
+    x = np.ascontiguousarray(x.T)
+    x = np.vstack([x, x]) if x.shape[0] == 1 else x[:2]
+    warnings = []
+    if x.shape[1] < sr:
+        raise HTTPException(400, f"{base!r} is shorter than a second")
+    if x.shape[1] > MAX_IMPORT_S * sr:
+        x = x[:, :int(MAX_IMPORT_S * sr)]
+        warnings.append(f"only the first {MAX_IMPORT_S / 60:.0f} minutes were imported")
+    x = audio.resample(x, sr, RAW_SR)
+    text = " ".join(text.split()) if text else ""
+    opt = effective_settings()
+    if check is not None:
+        opt["check"] = check
+    prompt = prompts.build_prompt(text, kind=kind) if text else ""
+    with _lock:
+        rid = new_id()
+        d = OUTPUT / rid
+        d.mkdir(parents=True)
+        rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "import", "engine": opt["engine"],
+               "model": "imported", "seeds": [0], "steps": None, "takes": [], "kind": kind, "text": text,
+               "prompt": prompt, "raw": False, "bpm": None, "key": None,
+               "name": name or prompts.track_name(Path(base).stem), "source": base,
+               "duration": round(x.shape[1] / RAW_SR, 2), "gen_length_s": round(x.shape[1] / RAW_SR, 2), "gen_s": 0.0,
+               "post": default_master(opt, None), "warnings": warnings}
+        path = d / "import.wav"
+        audio.write_wav(path, x, RAW_SR, subtype="FLOAT")
+        return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
+
+
+# --------------------------------------------------------------------------- arranging takes
+
+ARRANGE_CONTEXT_S = 20.0  # how much of each part the engine hears either side of a join
+ARRANGE_XFADE_S = 0.5     # original -> the engine's rendering of it, at the edges of each join
+
+
+class PartItem(BaseModel):
+    take: str
+    start: float | None = Field(None, ge=0)  # seconds on the take's raw timeline; default its start
+    end: float | None = Field(None, gt=0)    # default its end
+
+
+class ArrangeReq(ShapeFields):
+    parts: list[PartItem] = Field(min_length=2, max_length=12)
+    bridge: float | None = Field(None, ge=0, le=30)  # new music between parts; default 2 bars (4 s without a tempo)
+    blend: float = Field(1.0, ge=0.25, le=6)         # seconds of each part regenerated beside the bridge
+    text: str | None = Field(None, max_length=1000)  # what the bridges should be; default the first part's prompt
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+
+    @field_validator("text")
+    @classmethod
+    def _not_blank(cls, v: str | None) -> str | None:
+        return _clean_text(v)
+
+
+def _join(a: np.ndarray, b: np.ndarray, xf: int) -> np.ndarray:
+    """a then b, where a's last xf samples and b's first xf are the same moment: equal-power
+    crossfade across them."""
+    t = np.linspace(0.0, np.pi / 2, xf, dtype=np.float32)
+    return np.concatenate([a[:, :-xf], a[:, -xf:] * np.cos(t) + b[:, :xf] * np.sin(t), b[:, xf:]], axis=1)
+
+
+def _fit(y: np.ndarray, n: int) -> np.ndarray:
+    """y cut or zero-padded to n samples (the engine rounds lengths to whole samples its own way)."""
+    return y[:, :n] if y.shape[1] >= n else np.pad(y, ((0, 0), (0, n - y.shape[1])))
+
+
+def _arrangement_warnings(parts: list[dict]) -> list[str]:
+    """Neighbouring parts at different tempos or in unrelated keys: the bridge has to change them."""
+    out = []
+    for p, q in zip(parts, parts[1:]):
+        tp, tq = (z["take"].get("music", {}).get("tempo", {}) for z in (p, q))
+        if tp.get("bpm") and tq.get("bpm") and min(tp.get("confidence", 0), tq.get("confidence", 0)) \
+                >= checks.TEMPO_CONFIDENT and analysis.tempo_matches(tq["bpm"], tp["bpm"], tol=0.05) is None:
+            out.append(f"{p['ref']} is at {tp['bpm']:.0f} BPM and {q['ref']} at {tq['bpm']:.0f}: the bridge has to "
+                       "change tempo, which may sound abrupt")
+        kp, kq = (z["take"].get("music", {}).get("key", {}) for z in (p, q))
+        if kp.get("key") and kq.get("key") and min(kp.get("strength", 0), kq.get("strength", 0)) >= checks.KEY_CONFIDENT:
+            pp, pm = analysis.parse_key(kp["key"])
+            qp, qm = analysis.parse_key(kq["key"])
+            if analysis.key_relation(qp, qm, pp, pm) is None:
+                out.append(f"{p['ref']} is in {kp['key']} and {q['ref']} in {kq['key']}: the bridge has to modulate")
+    return out
+
+
+@app.post("/api/arrange")
+def arrange(req: ArrangeReq):
+    """Several takes (or spans of them), in order, as one new song: at each join the engine hears
+    up to 20 s of the part before and after, and writes `bridge` seconds of new music between
+    them, regenerating `blend` seconds either side so the parts flow into it. Each take of the
+    result is the whole song, its bridges made with one seed."""
+    saved = local_settings()
+    opt = _resolve(req, saved)
+    parts = []
+    last = len(req.parts) - 1
+    for i, item in enumerate(req.parts):
+        src, take, raw_path = _source(item.take)
+        x, sr = audio.read(raw_path)
+        total = x.shape[1] / sr
+        # At a join the engine must hear music, not a fade-out and silence (given those, it
+        # writes a silent bridge): an inner edge starts or ends with the part's body, unless the
+        # span sets it. The song's very start and end stay as they are.
+        b0, b1 = analysis.body(x, sr)
+        a = item.start if item.start is not None else (b0 / sr if i > 0 else 0.0)
+        b = min(item.end, total) if item.end is not None else (b1 / sr if i < last else total)
+        if not 0 <= a < b or b - a < 4.0:
+            raise HTTPException(400, f"part {item.take}: the span must be at least 4 s inside the take (0..{total:.1f} s)")
+        parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)],
+                      "start": round(a, 2), "end": round(b, 2)})
+    first = parts[0]["src"]
+    tempo = parts[0]["take"].get("music", {}).get("tempo", {})
+    bpm = first.get("bpm") or (tempo.get("bpm") if tempo.get("confidence", 0) >= checks.TEMPO_CONFIDENT else None)
+    bridge = req.bridge if req.bridge is not None else (8 * 60.0 / bpm if bpm else 4.0)
+    prompt = (prompts.build_prompt(req.text, first.get("bpm"), first.get("key"), first.get("kind", "music"),
+                                   raw=bool(first.get("raw"))) if req.text else first["prompt"])
+    with _lock:
+        engine = req.engine if "engine" in req.model_fields_set and req.engine else first["engine"]
+        w = _start(engine)
+        seeds = _seeds(req, opt)
+        base = {**first["post"]}
+        base.pop("duration", None)
+        base["loop_bars"] = None
+        po = master_opts(base, req)
+        total_s = sum(p["x"].shape[1] for p in parts) / RAW_SR + bridge * (len(parts) - 1)
+        name = req.name or (prompts.track_name(req.text) if req.text else f"{first['name']}-arranged")
+        rec = _new_record("arrange", opt, w.info, engine, seeds, kind=first.get("kind", "music"),
+                          text=req.text or first.get("text", ""), prompt=prompt, raw=bool(first.get("raw")),
+                          bpm=first.get("bpm"), key=first.get("key"), name=name[:60],
+                          parts=[{"take": p["ref"], "start": p["start"], "end": p["end"]} for p in parts],  # as used
+                          bridge=round(bridge, 2), blend=req.blend, duration=round(total_s, 2), post=po.asdict(),
+                          clap_prompt=first["prompt"] or None, warnings=_arrangement_warnings(parts))
+        d = req_dir(rec["id"])
+        t0 = time.time()
+        joins = []
+        for j, (p, q) in enumerate(zip(parts, parts[1:])):
+            # Each part's two joins share it: neither may hear more than half of it.
+            ctx_n = int(min(ARRANGE_CONTEXT_S, p["x"].shape[1] / RAW_SR / 2, q["x"].shape[1] / RAW_SR / 2) * RAW_SR)
+            gap = int(bridge * RAW_SR)
+            ctx = np.concatenate([p["x"][:, -ctx_n:], np.zeros((2, gap), np.float32), q["x"][:, :ctx_n]], axis=1)
+            path = d / f"join{j}.wav"
+            audio.write_wav(path, ctx, RAW_SR, subtype="FLOAT")
+            ctx_s = ctx_n / RAW_SR
+            blend = max(0.0, min(req.blend, ctx_s - 2 * ARRANGE_XFADE_S))
+            job = {"op": "generate", "prompt": prompt, "duration": ctx.shape[1] / RAW_SR, "seeds": seeds,
+                   "steps": rec["steps"], "out_dir": str(d), "stem": f"join{j}", "inpaint_audio": str(path),
+                   "mask_start": ctx_s - blend, "mask_end": ctx_s + bridge + blend}
+            reply = _call(rec, job, w)
+            joins.append({"ctx_n": ctx_n, "n": ctx.shape[1], "renders": {int(f["seed"]): f["path"] for f in reply["files"]}})
+            path.unlink(missing_ok=True)
+        rec["gen_s"] = round(time.time() - t0, 2)
+        rec["gen_length_s"] = round(sum(jn["n"] for jn in joins) / RAW_SR, 2)
+        xf = int(ARRANGE_XFADE_S * RAW_SR)
+        files = []
+        try:
+            for seed in seeds:
+                # Part 0 up to its join (plus the crossfade), the join's rendering, part 1 from its
+                # side of that join (minus the crossfade) up to the next join, and so on. Every
+                # meeting of original and rendering is the same moment on both sides: crossfaded.
+                first_x = parts[0]["x"]
+                song = first_x[:, :first_x.shape[1] - joins[0]["ctx_n"] + xf]
+                for j, jn in enumerate(joins):
+                    r, _ = audio.read(jn["renders"][seed])
+                    song = _join(song, _fit(r, jn["n"]), xf)
+                    q = parts[j + 1]["x"]
+                    end = q.shape[1] - joins[j + 1]["ctx_n"] + xf if j + 1 < len(joins) else q.shape[1]
+                    song = _join(song, q[:, jn["ctx_n"] - xf:end], xf)
+                path = d / f"gen_{seed}.wav"
+                audio.write_wav(path, song, RAW_SR, subtype="FLOAT")
+                files.append({"seed": seed, "path": str(path)})
+            for jn in joins:
+                for f in jn["renders"].values():
+                    Path(f).unlink(missing_ok=True)
+        except Exception as exc:
+            shutil.rmtree(d, ignore_errors=True)
+            raise HTTPException(500, f"stitching failed: {type(exc).__name__}: {exc}") from exc
+        return _finish(rec, {"files": files}, opt)
 
 
 class MasterReq(MasterFields):

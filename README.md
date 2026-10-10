@@ -4,7 +4,9 @@ A private, fully local **instrumental music generator**, built for AI agents (an
 call. Describe the music (genre, instruments, mood, tempo, key) and get back mastered
 tracks: checked, scored and ranked best-of-N, as 48 kHz WAVs and MP3s, with a waveform,
 loudness and spectrogram picture of each so an agent that can't listen can still judge them.
-Continue a track, make variations, redo a section, or cut a seamless loop on the bar.
+Continue a track, make variations, redo a section, or cut a seamless loop on the bar; start
+from your own audio file; or join several takes into one song, with new music written at
+each join.
 
 It runs **Stable Audio 3 Medium**, the best open-weights model on the
 [Artificial Analysis instrumental leaderboard](https://artificialanalysis.ai/music/leaderboard/instrumental)
@@ -38,6 +40,8 @@ below:
 python scripts\music.py "warm lo-fi hip hop, dusty piano chords, vinyl crackle" --bpm 84 --out D:\music
 python scripts\music.py "8-bit chiptune boss battle" --bpm 160 --loop-bars 8 --out D:\music
 python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
+python scripts\music.py "a warm music box melody" --vary D:\audio\demo.wav --strength 0.5
+python scripts\music.py "a drum fill and a riser" --combine <intro ref> <main ref> <outro ref>
 ```
 
 ## How it works
@@ -82,7 +86,48 @@ python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
 | **vary** `--vary REF --strength X` | starts from the take instead of from noise (audio-to-audio): 0.1 is close, 0.5 keeps the style and sound but rewrites the notes, 1 is unrelated | variations, same length |
 | **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span, keeps the rest, joins it musically | the whole track |
 
-A new text replaces the prompt for that part (default: the source's). Extending past the
+A new text replaces the prompt for that part (default: the source's).
+
+### Your own audio
+
+`--import FILE ["what it is"]` (or **Start from your own audio** on the page) turns a WAV, FLAC,
+OGG or MP3 into a take of an `import` request (seed 0): checked, measured and mastered like a
+generated one, nothing generated. Everything above works from its ref: extend it into a longer
+piece, vary it (timbre or style transfer: a melody played on another instrument at strength
+~0.4-0.6), inpaint a span, loop it, master it, or put it in a song. The description becomes the
+prompt that later work continues from; without one, the engine is led by the audio alone (and
+CLAP has nothing to score). `--extend`, `--vary` and `--inpaint` take a file path directly too
+(imported first). Up to 20 minutes and 300 MB; other formats (M4A, AAC) need converting first.
+What you may do with someone else's recording is up to its licence: the tool doesn't check.
+
+Measured: Windows' `Alarm01.wav` (5.6 s) extended by 40 s as "an upbeat tropical house track
+built around a bright marimba melody" came back as music (CE 7.4, PQ 8.4); varied at 0.5 as
+"a warm music box melody", its CLAP match to that description rose from 0.37 to 0.45.
+
+### Joining takes into one song
+
+`--combine A B C` (or **Add to song** on takes, then **Combine** on the page) joins takes in
+order. At each join the engine hears up to 20 s of the part before and after, writes `--bridge`
+seconds of new music between them (default 2 bars at the first part's tempo, 4 s without one;
+0 blends the parts straight into each other) and rewrites `--blend` seconds (default 1) of each
+part beside it so they flow into it. The parts are otherwise kept as they were: the edges where
+original and rendering meet are crossfaded over half a second. The text describes the bridges
+("a big drum fill and a rising synth sweep"; default: the first part's prompt).
+
+- A part can be a span of a take: `REF@20-60` (seconds; `REF@30-` from 30 s to the end).
+- At inner joins a part is cut to its *body*: a fade-out, a final chord dying away or silence
+  before a join (and a fade-in after one) would tell the engine the music had ended, and it
+  wrote silent bridges. A span you give sets that edge yourself; the song's very start and end
+  stay as they are.
+- Parts at different tempos or in unrelated keys get a warning: the bridge has to change
+  them, and may sound abrupt. Generating the parts with the same `--bpm` and `--key` avoids it.
+- Each take of the result is the whole song, its bridges made with one seed (a few seconds per
+  join), then checked, scored and mastered like any take.
+
+Measured: an intro (pads, no drums), a main part (drums, bass, lead) and an outro, each made
+separately at 100 BPM, joined with "a big drum fill and a rising synth sweep": 109 s at 100.0
+BPM, CE 7.4, PQ 8.2, no warnings; the drums build in across the first bridge, and the bar grid
+runs through both joins unbroken. Extending past the
 engine's 380 s window works too: it hears the last part of the track and the beginning is put
 back in front, crossfaded over half a second where the original meets the engine's rendering
 of it. (The engine re-renders whatever it hears: the same music, not the same waveform.)
@@ -182,7 +227,9 @@ python scripts\music.py --settings
 | `--fade-in S` / `--fade-out S` | Fades. `--fade-out` unset means auto (3 s, only when the take stops at full level); `0` keeps a hard cut. |
 | `--lufs X` / `--peak X` | Loudness target (default -14; -16 to -18 sits under dialogue) and true-peak ceiling (default -1 dBTP). |
 | `--loop-bars N` / `--beats-per-bar N` | Deliver a seamless loop of N bars (give `--bpm` when generating so the take is long enough); 4 beats per bar by default. |
-| `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take (above). |
+| `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take, or an audio file (above). |
+| `--import FILE` | Your own audio as a take; the text describes it. |
+| `--combine PART PART...`, `--bridge S`, `--blend S` | Join takes into one song; parts are `REF` or `REF@START-END`. Put the text before `--combine`. |
 | `--master REQ` | Re-master a request with the mastering flags; `--no-loop`, `--full-length` undo a loop or a cut. |
 | `--out DIR` | Copy the best take (`--best N`, `--all`) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
 | `--play`, `--no-save`, `--json`, `--wait S` | Play the best take; delete the request afterwards; print the server's JSON; wait for the server. |
@@ -208,6 +255,8 @@ full output goes to `logs\server.log`, timestamped. Each start keeps the previou
 | `POST /api/extend` | `{"take", "seconds"?, "text"?, + shape and mastering}` | the same, for the longer track |
 | `POST /api/vary` | `{"take", "strength"?, "text"?, ...}` | variations |
 | `POST /api/inpaint` | `{"take", "start", "end", "text"?, ...}` | the take with that span redone |
+| `POST /api/import?filename=&text=&kind=&name=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
+| `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
 | `POST /api/master` | `{"request", "length"?, "fade_in"?, "fade_out"?, "lufs"?, "peak_dbtp"?, "loop_bars"?, "beats_per_bar"?, "bpm"?}` | the request, re-mastered (`null` clears `length` / `loop_bars`) |
 | `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>` | | list, one, delete |
 | `GET /api/prompt?text=&bpm=&key=&kind=&raw=` | | the prompt and file name a request would use |
@@ -235,8 +284,10 @@ Every request is a folder `output\<id>\` (clear it any time):
 
 http://127.0.0.1:8192/ does the same: the description, seconds, BPM, key and kind up front,
 mastering and fine-tuning folded away, then one card per take with its scores, tempo and key,
-player, picture, downloads, and **Extend / Vary / Inpaint**; per request, **Re-master**,
-**Make loops** and **delete**. `Ctrl+Enter` generates.
+player, picture, downloads, **Add to song**, and **Extend / Vary / Inpaint**; per request,
+**Re-master**, **Make loops** and **delete**. On the left, **Start from your own audio** imports
+a file, and **Song** lists the takes you added (reorder, trim each to a span, set the bridge)
+for **Combine**. `Ctrl+Enter` generates.
 
 ### Speed (RTX 5080)
 

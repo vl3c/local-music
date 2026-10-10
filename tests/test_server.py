@@ -256,3 +256,88 @@ def test_the_server_runs_only_in_its_window(server, monkeypatch):
     monkeypatch.delenv(server.WINDOW_MARK, raising=False)
     with pytest.raises(SystemExit, match="start.cmd"):
         server.main()
+
+
+# ------------------------------------------------------------------ your own audio
+
+def wav_bytes(x, sr=SR) -> bytes:
+    import io
+
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, x.T, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def test_import_makes_a_take_the_rest_can_start_from(client, server):
+    data = wav_bytes(band(100, 15.0, stereo=False, sr=48000), 48000)
+    r = client.post("/api/import", params={"filename": "C:\music\My Song.wav"}, content=data,
+                    headers={"Content-Type": "application/octet-stream"})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    t = res["takes"][0]
+    assert res["op"] == "import" and res["source"] == "My Song.wav" and res["name"] == "my-song"
+    assert t["ref"].endswith(":0") and res["prompt"] == "" and "clap" not in t and t["aes"]["PQ"] == 7.5
+    assert t["music"]["tempo"]["bpm"] == pytest.approx(100, abs=1) and t["signal"]["duration_s"] == pytest.approx(15, abs=0.01)
+    assert not server._fake.jobs  # nothing generated
+    client.post("/api/vary", json={"take": t["ref"], "strength": 0.4, "n": 1})
+    job = server._fake.jobs[-1]
+    assert job["prompt"] == "" and job["init_audio"].endswith("0_raw.wav")  # led by the audio alone
+    client.post("/api/extend", json={"take": t["ref"], "seconds": 10, "text": "the same, with strings", "n": 1})
+    assert "the same, with strings" in server._fake.jobs[-1]["prompt"]
+
+
+def test_import_with_a_description_is_scored_against_it(client, server):
+    from music import audio
+    p = server.OUTPUT / "x.mp3"
+    audio.write_mp3(p, band(120, 6.0, sr=48000))
+    r = client.post("/api/import", params={"filename": "groove.mp3", "text": "a funky drum groove"},
+                    content=p.read_bytes())
+    res = r.json()
+    assert res["prompt"].endswith("a funky drum groove") and res["takes"][0]["clap"] == 0.4
+    assert server._fake_clap.prompt == "a funky drum groove"
+
+
+@pytest.mark.parametrize("data,code", [(b"", 400), (b"not audio at all" * 100, 400)])
+def test_import_refuses_what_isnt_audio(client, data, code):
+    r = client.post("/api/import", params={"filename": "x.m4a"}, content=data)
+    assert r.status_code == code and ("audio" in r.json()["detail"])
+
+
+def test_import_refuses_a_cross_site_upload(client):
+    r = client.post("/api/import", params={"filename": "a.wav"}, content=wav_bytes(band(100, 3.0)),
+                    headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+
+
+# ------------------------------------------------------------------ arranging
+
+def test_arrange_bridges_parts_into_one_song(client, server):
+    a = gen(client, n=1, duration=30, bpm=120)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=30, bpm=120)["takes"][0]["ref"]
+    c = gen(client, n=1, duration=20, bpm=120)["takes"][0]["ref"]
+    before = len(server._fake.jobs)
+    r = client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b, "start": 5, "end": 25}, {"take": c}],
+                                         "n": 2, "seed": 7})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    jobs = server._fake.jobs[before:]
+    assert len(jobs) == 2 and all(j["seeds"] == [7, 8] for j in jobs)  # one engine call per join
+    assert res["bridge"] == pytest.approx(4.0)  # 2 bars at 120 BPM
+    # join 0 hears 10 s of each side (half of part b's 20 s span), join 1 hears 10 s of b and of c
+    assert jobs[0]["duration"] == pytest.approx(10 + 4 + 10, abs=0.01)
+    assert (jobs[0]["mask_start"], jobs[0]["mask_end"]) == (pytest.approx(9.0), pytest.approx(15.0))
+    assert res["op"] == "arrange" and [p["take"] for p in res["parts"]] == [a, b, c]
+    for t in res["takes"]:
+        assert t["signal"]["duration_s"] == pytest.approx(30 + 20 + 20 + 2 * 4.0, abs=0.05)
+    assert not list((server.OUTPUT / res["id"]).glob("join*")) and not list((server.OUTPUT / res["id"]).glob("gen_*"))
+
+
+def test_arrange_warns_about_a_tempo_change_and_checks_spans(client, server):
+    a = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    server._fake.call = (lambda orig: lambda job: orig({**job, "bpm_fake": 90.0}))(server._fake.call)
+    b = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    res = client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b}], "bridge": 2, "n": 1}).json()
+    assert any("BPM" in w and "change tempo" in w for w in res["warnings"])
+    assert client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b, "start": 18}]}).status_code == 400
+    assert client.post("/api/arrange", json={"parts": [{"take": a}]}).status_code == 422

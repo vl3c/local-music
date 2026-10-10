@@ -1,6 +1,6 @@
 ---
 name: local-music
-description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
+description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus; or start from the user's own audio file (continue it, restyle it), or join several takes into one song with bridges written between them. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
 ---
 
 # local-music: instrumental music on the local GPU
@@ -109,6 +109,9 @@ $PY $M --vary <ref> --strength 0.3 --n 4                        # variations of 
 $PY $M --inpaint <ref> --span 20-28 "a drum fill"              # redo that span, keep the rest
 $PY $M --master <request id> --loop-bars 4                      # re-master: no regeneration
 $PY $M --master <request id> --no-loop --fade-out 5 --lufs -16
+$PY $M --import <file> "a slow acoustic folk song"            # the user's audio as a take (ref <id>:0)
+$PY $M "a warm music box melody" --vary <file> --strength 0.5    # files work directly too
+$PY $M "a big drum fill and a riser" --combine <intro ref> <main ref>@0-40 <outro ref>   # one song
 $PY $M --show-prompt "dark synthwave" --bpm 100                 # what the engine would get
 $PY $M --list          $PY $M --settings          $PY $M --engines
 ```
@@ -195,6 +198,16 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   new text for that part if wanted ("a drum break", "the strings drop out").
 - **Different length, loudness, fades, or a loop**: `--master <request id> ...`, no
   regeneration.
+- **From the user's own audio**: `--import <file> "what it is"`, then work from its ref; or pass
+  the file to `--extend` / `--vary` / `--inpaint`. A melody on another instrument: `--vary` at
+  0.4-0.6 with the new instrument as the text. Don't import recordings the user has no right to
+  rework without saying so.
+- **A song from sections**: make each part separately with the **same `--bpm` and `--key`**
+  (an intro without drums, a main part, a breakdown, an outro), then `"<what the bridges
+  are>" --combine A B C` (text first). Bridges default to 2 bars; `--bridge 0` blends parts
+  straight into each other. Parts are cut to their body at the joins (fades and silence would
+  make silent bridges); `REF@START-END` picks a span yourself. Read the result's PNG at each
+  join: the bar grid should run through, the loudness shouldn't fall into a hole.
 
 ## 6. Delivering
 

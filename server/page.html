@@ -56,6 +56,10 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
 .working { text-align:center; padding:40px 14px; color:var(--muted); }
 #big { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; align-items:center; justify-content:center; z-index:60; }
 #big img { max-width:96vw; max-height:94vh; } #big.on { display:flex; }
+.part { display:grid; grid-template-columns:1fr 84px auto auto; gap:4px; align-items:center; padding:4px 0; border-bottom:1px dashed var(--line); font-size:12px; }
+.part span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.part input { padding:3px 5px; font-size:12px; }
+.part button { padding:1px 7px; font-size:12px; }
 </style>
 </head>
 <body>
@@ -102,6 +106,24 @@ details.adv { margin-top:14px; border-top:1px solid var(--line); padding-top:10p
       <button id="reset" title="Delete config.local.json: back to the built-in defaults">Reset to built-in</button>
     </div>
   </details>
+
+  <h2>Start from your own audio</h2>
+  <input type="file" id="file" accept=".wav,.flac,.ogg,.mp3,audio/wav,audio/flac,audio/ogg,audio/mpeg" title="WAV, FLAC, OGG or MP3. It becomes a take: extend it, vary it, redo a span, loop it or put it in a song.">
+  <input id="filetext" placeholder="what it is (optional), e.g. a slow acoustic folk song" style="margin-top:6px" title="Describes the audio: it becomes the prompt later work continues from. Empty: the engine is led by the audio alone.">
+  <button class="wide" id="importbtn" style="margin-top:6px">Import</button>
+
+  <h2>Song</h2>
+  <div class="small" id="songempty">Add takes with <b>Add to song</b> on their cards; they're joined in this order, with new music written at each join.</div>
+  <div id="song"></div>
+  <div class="row" id="songopts" hidden>
+    <div><label for="bridge">Bridge (s)</label><input id="bridge" type="number" min="0" max="30" step="0.5" placeholder="2 bars" title="New music at each join. Empty: 2 bars at the first part's tempo. 0: the parts blend straight into each other."></div>
+    <div><label for="blendin">Blend (s)</label><input id="blendin" type="number" min="0.25" max="6" step="0.25" placeholder="1" title="How much of each part is rewritten beside the bridge, so it flows in and out"></div>
+  </div>
+  <input id="bridgetext" placeholder="the bridges (optional), e.g. a drum fill and a riser" hidden style="margin-top:6px" title="What the new music at the joins should be. Empty: the first part's prompt.">
+  <div class="btns" id="songbtns" hidden>
+    <button class="primary" id="combine">Combine</button>
+    <button id="songclear">Clear</button>
+  </div>
 
   <h2>Recent</h2>
   <div class="history" id="history"></div>
@@ -226,6 +248,7 @@ function card(res, t) {
   c.append(el("div", {class: "btns"},
     el("a", {class: "button", href: "/files/" + f.wav, download: res.name + "_" + t.seed + ".wav", text: "WAV"}),
     el("a", {class: "button", href: "/files/" + f.mp3, download: res.name + "_" + t.seed + ".mp3", text: "MP3"}),
+    el("button", {text: "Add to song", title: "Add this take to the Song on the left: takes there are joined in order, with new music at each join", onclick: () => addPart(t.ref, res.name, t.signal && t.signal.duration_s)}),
     el("span", {class: "small", text: t.ref})));
   const secs = el("input", {type: "number", min: "2", max: "360", value: "30", title: "seconds of new music"});
   const str = el("input", {type: "number", min: "0.05", max: "1", step: "0.05", value: "0.5", title: "0.1 close, 0.5 same style new notes, 1 unrelated"});
@@ -244,7 +267,8 @@ function card(res, t) {
 
 function show(res) {
   current = res;
-  const what = (res.op || "generate") + (res.source ? " of " + res.source : "");
+  const what = (res.op || "generate") + (res.source ? " of " + res.source : "") +
+    (res.parts ? " of " + res.parts.length + " parts, bridges of " + res.bridge + " s" : "");
   const loopBars = el("input", {type: "number", min: "1", max: "64", value: (res.post && res.post.loop_bars) || 4, style: "width:70px"});
   const head = el("div", {class: "reqhead"},
     el("h2", {text: res.name}),
@@ -303,6 +327,64 @@ $("reset").addEventListener("click", async () => {
   settings = await api("/api/settings", undefined, "DELETE"); fill(settings.effective);
 });
 $("big").addEventListener("click", () => $("big").classList.remove("on"));
+
+// ---- your own audio
+$("importbtn").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { $("msg").textContent = "Choose an audio file first."; return; }
+  if (busy) return;
+  $("msg").textContent = "";
+  setBusy(true, "Importing " + f.name);
+  try {
+    const q = new URLSearchParams({filename: f.name});
+    if ($("filetext").value.trim()) q.set("text", $("filetext").value.trim());
+    const r = await fetch("/api/import?" + q, {method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: f});
+    const data = await r.json();
+    if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : r.statusText);
+    show(data); history();
+  } catch (e) { $("msg").textContent = e.message; if (current) show(current); else $("view").replaceChildren(); }
+  finally { setBusy(false); }
+});
+
+// ---- the song: takes joined in order (kept in this browser between visits)
+let song = [];
+try { song = JSON.parse(localStorage.getItem("local-music-song") || "[]"); } catch (e) { song = []; }
+function saveSong() { try { localStorage.setItem("local-music-song", JSON.stringify(song)); } catch (e) { /* private window */ } }
+function addPart(ref, name, dur) { song.push({take: ref, name: name, dur: dur, span: ""}); saveSong(); drawSong(); }
+function drawSong() {
+  const has = song.length > 0;
+  $("songempty").hidden = has; $("songopts").hidden = !has; $("bridgetext").hidden = !has; $("songbtns").hidden = !has;
+  $("song").replaceChildren(...song.map((p, i) => {
+    const span = el("input", {value: p.span, placeholder: "all" + (p.dur ? " (" + Math.round(p.dur) + " s)" : ""), title: "Use only START-END seconds of this take, e.g. 20-60, or 30- (from 30 s to the end). Empty: all of it."});
+    span.addEventListener("input", () => { p.span = span.value; saveSong(); });
+    return el("div", {class: "part"},
+      el("span", {title: p.take, text: (i + 1) + ". " + p.name + " · " + p.take.split(":")[1]}), span,
+      el("button", {text: "↑", title: "Move earlier", onclick: () => { if (i > 0) { [song[i - 1], song[i]] = [song[i], song[i - 1]]; saveSong(); drawSong(); } }}),
+      el("button", {text: "×", title: "Remove", onclick: () => { song.splice(i, 1); saveSong(); drawSong(); }}));
+  }));
+}
+$("songclear").addEventListener("click", () => { song = []; saveSong(); drawSong(); });
+$("combine").addEventListener("click", () => {
+  if (song.length < 2) { $("msg").textContent = "A song needs at least two parts."; return; }
+  const parts = [];
+  for (const p of song) {
+    const part = {take: p.take};
+    const s = (p.span || "").trim();
+    if (s) {
+      const m = /^([\d.]*)\s*-\s*([\d.]*)$/.exec(s);
+      if (!m) { $("msg").textContent = "a span is START-END in seconds, e.g. 20-60"; return; }
+      if (m[1]) part.start = Number(m[1]);
+      if (m[2]) part.end = Number(m[2]);
+    }
+    parts.push(part);
+  }
+  const b = {parts, n: num("n") || undefined};
+  if (num("bridge") != null) b.bridge = num("bridge");
+  if (num("blendin") != null) b.blend = num("blendin");
+  if ($("bridgetext").value.trim()) b.text = $("bridgetext").value.trim();
+  run("/api/arrange", b, "Writing the bridges");
+});
+drawSong();
 
 loadSettings().catch(() => {});
 history(); status(); setInterval(status, 5000);
