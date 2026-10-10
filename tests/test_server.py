@@ -256,3 +256,284 @@ def test_the_server_runs_only_in_its_window(server, monkeypatch):
     monkeypatch.delenv(server.WINDOW_MARK, raising=False)
     with pytest.raises(SystemExit, match="start.cmd"):
         server.main()
+
+
+# ------------------------------------------------------------------ your own audio
+
+def wav_bytes(x, sr=SR) -> bytes:
+    import io
+
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, x.T, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def test_import_makes_a_take_the_rest_can_start_from(client, server):
+    data = wav_bytes(band(100, 15.0, stereo=False, sr=48000), 48000)
+    r = client.post("/api/import", params={"filename": r"C:\music\My Song.wav"}, content=data,
+                    headers={"Content-Type": "application/octet-stream"})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    t = res["takes"][0]
+    assert res["op"] == "import" and res["source"] == "My Song.wav" and res["name"] == "my-song"
+    assert t["ref"].endswith(":0") and res["prompt"] == "" and "clap" not in t and t["aes"]["PQ"] == 7.5
+    assert t["music"]["tempo"]["bpm"] == pytest.approx(100, abs=1) and t["signal"]["duration_s"] == pytest.approx(15, abs=0.01)
+    assert not server._fake.jobs  # nothing generated
+    client.post("/api/vary", json={"take": t["ref"], "strength": 0.4, "n": 1})
+    job = server._fake.jobs[-1]
+    assert job["prompt"] == "" and job["init_audio"].endswith("0_raw.wav")  # led by the audio alone
+    client.post("/api/extend", json={"take": t["ref"], "seconds": 10, "text": "the same, with strings", "n": 1})
+    assert "the same, with strings" in server._fake.jobs[-1]["prompt"]
+
+
+def test_import_with_a_description_is_scored_against_it(client, server):
+    from music import audio
+    p = server.OUTPUT / "x.mp3"
+    audio.write_mp3(p, band(120, 6.0, sr=48000))
+    r = client.post("/api/import", params={"filename": "groove.mp3", "text": "a funky drum groove"},
+                    content=p.read_bytes())
+    res = r.json()
+    assert res["prompt"].endswith("a funky drum groove") and res["takes"][0]["clap"] == 0.4
+    assert server._fake_clap.prompt == "a funky drum groove"
+
+
+@pytest.mark.parametrize("data,code", [(b"", 400), (b"not audio at all" * 100, 400)])
+def test_import_refuses_what_isnt_audio(client, data, code):
+    r = client.post("/api/import", params={"filename": "x.m4a"}, content=data)
+    assert r.status_code == code and ("audio" in r.json()["detail"])
+
+
+def test_import_refuses_a_cross_site_upload(client):
+    r = client.post("/api/import", params={"filename": "a.wav"}, content=wav_bytes(band(100, 3.0)),
+                    headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+
+
+# ------------------------------------------------------------------ arranging
+
+def test_arrange_bridges_parts_into_one_song(client, server):
+    a = gen(client, n=1, duration=30, bpm=120)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=30, bpm=120)["takes"][0]["ref"]
+    c = gen(client, n=1, duration=20, bpm=120)["takes"][0]["ref"]
+    before = len(server._fake.jobs)
+    r = client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b, "start": 5, "end": 25}, {"take": c}],
+                                         "n": 2, "seed": 7})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    jobs = server._fake.jobs[before:]
+    assert len(jobs) == 2 and all(j["seeds"] == [7, 8] for j in jobs)  # one engine call per join
+    assert res["bridge"] == pytest.approx(4.0)  # 2 bars at 120 BPM
+    # join 0 hears 10 s of each side (half of part b's 20 s span), join 1 hears 10 s of b and of c
+    assert jobs[0]["duration"] == pytest.approx(10 + 4 + 10, abs=0.01)
+    assert (jobs[0]["mask_start"], jobs[0]["mask_end"]) == (pytest.approx(9.0), pytest.approx(15.0))
+    assert res["op"] == "arrange" and [p["take"] for p in res["parts"]] == [a, b, c]
+    assert all(p["name"] == "steady-test-groove" for p in res["parts"])
+    for t in res["takes"]:
+        assert t["signal"]["duration_s"] == pytest.approx(30 + 20 + 20 + 2 * 4.0, abs=0.05)
+    assert not list((server.OUTPUT / res["id"]).glob("join*")) and not list((server.OUTPUT / res["id"]).glob("gen_*"))
+
+
+def test_arrange_warns_about_a_tempo_change_and_checks_spans(client, server):
+    a = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    server._fake.call = (lambda orig: lambda job: orig({**job, "bpm_fake": 90.0}))(server._fake.call)
+    b = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    res = client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b}], "bridge": 2, "n": 1}).json()
+    assert any("BPM" in w and "change tempo" in w for w in res["warnings"])
+    assert client.post("/api/arrange", json={"parts": [{"take": a}, {"take": b, "start": 18}]}).status_code == 400
+    assert client.post("/api/arrange", json={"parts": [{"take": a}]}).status_code == 422
+
+
+# ------------------------------------------------------------------ mixing
+
+def test_mix_puts_a_voice_over_the_music_at_set_volumes(client, server):
+    song = gen(client, n=1, duration=20, bpm=120)["takes"][0]["ref"]
+    voice_x = np.zeros((1, 6 * 48000), np.float32)
+    voice_x[0, 48000:4 * 48000] = 0.4 * np.sin(np.arange(3 * 48000) / 48000 * 2 * np.pi * 180)
+    voice = client.post("/api/import", params={"filename": "voice.wav"}, content=wav_bytes(voice_x, 48000)).json()
+    vref = voice["takes"][0]["ref"]
+    n_jobs = len(server._fake.jobs)
+    r = client.post("/api/mix", json={"layers": [{"take": song, "gain_db": -9}, {"take": vref, "at": 5}]})
+    assert r.status_code == 200, r.text
+    res = r.json()
+    t = res["takes"][0]
+    assert res["op"] == "mix" and len(server._fake.jobs) == n_jobs  # nothing generated
+    assert [(ly["take"], ly["gain_db"], ly["at"]) for ly in res["layers"]] == [(song, -9, 0), (vref, 0, 5)]
+    assert [ly["name"] for ly in res["layers"]] == ["steady-test-groove", "voice"]
+    assert t["signal"]["duration_s"] == pytest.approx(20.0, abs=0.05) and t["ref"].endswith(":0")
+    assert res["prompt"] == client.get(f"/api/requests/{song.split(':')[0]}").json()["prompt"]  # the first layer's
+    # The mix is a take like any other: it can be extended.
+    client.post("/api/extend", json={"take": t["ref"], "seconds": 10, "n": 1})
+    assert server._fake.jobs[-1]["inpaint_audio"].endswith("0_raw.wav")
+
+
+def test_mix_runs_as_long_as_its_longest_layer_and_validates(client):
+    a = gen(client, n=1, duration=10)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=8)["takes"][0]["ref"]
+    res = client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "at": 6, "start": 2}]}).json()
+    assert res["takes"][0]["signal"]["duration_s"] == pytest.approx(12.0, abs=0.1)
+    assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "start": 30}]}).status_code == 400
+    assert client.post("/api/mix", json={"layers": [{"take": a}, {"take": b, "gain_db": 40}]}).status_code == 422
+    assert client.post("/api/mix", json={"layers": [{"take": a}]}).status_code == 422
+
+
+# ------------------------------------------------------------------ what the engine writes, and what it doesn't
+
+def raw_of(server, ref):
+    from music import audio
+    rid, seed = ref.split(":")
+    rec = json.loads((server.OUTPUT / rid / "request.json").read_text(encoding="utf-8"))
+    t = next(t for t in rec["takes"] if t["seed"] == int(seed))
+    return audio.read(server.OUTPUT / rid / t["raw"])[0], t
+
+
+def noisy_engine(server, monkeypatch):
+    """The fake engine writes loud noise everywhere it was asked for audio: whatever of the
+    source survives in the result, the server put back."""
+    from music import audio
+
+    def call(job):
+        server._fake.jobs.append(job)
+        files = []
+        for s in job["seeds"]:
+            x = np.random.default_rng(s).standard_normal((2, int(job["duration"] * SR))).astype(np.float32) * 0.3
+            p = Path(job["out_dir"]) / f"{job['stem']}_{s}.wav"
+            audio.write_wav(p, x, SR, subtype="FLOAT")
+            files.append({"seed": s, "path": str(p)})
+        return {"ok": True, "files": files, "sample_rate": SR}
+    monkeypatch.setattr(server._fake, "call", call)
+
+
+def test_inpaint_keeps_everything_outside_the_span(client, server, monkeypatch):
+    src = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    x, _ = raw_of(server, src)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/inpaint", json={"take": src, "start": 8, "end": 12, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape == x.shape
+    assert np.array_equal(y[:, :8 * SR - xf], x[:, :8 * SR - xf]) and np.array_equal(y[:, 12 * SR + xf:], x[:, 12 * SR + xf:])
+    assert not np.allclose(y[:, 9 * SR:11 * SR], x[:, 9 * SR:11 * SR])
+
+
+def test_extend_keeps_the_source_in_front(client, server, monkeypatch):
+    src = gen(client, n=1, duration=15)["takes"][0]["ref"]
+    x, _ = raw_of(server, src)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/extend", json={"take": src, "seconds": 5, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape[1] == x.shape[1] + 5 * SR
+    assert np.array_equal(y[:, :x.shape[1] - xf], x[:, :x.shape[1] - xf])
+    # past the window: the head and the context are both the source
+    server._fake.info["max_duration"] = 18.0  # hears 13 s of the 15 s source
+    res = client.post("/api/extend", json={"take": src, "seconds": 5, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    assert server._fake.jobs[-1]["duration"] == pytest.approx(18.0, abs=0.01)
+    assert y.shape[1] == x.shape[1] + 5 * SR and np.array_equal(y[:, :x.shape[1] - xf], x[:, :x.shape[1] - xf])
+
+
+def test_arrange_keeps_the_parts_and_writes_only_the_joins(client, server, monkeypatch):
+    a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    b = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    xa, ta = raw_of(server, a)
+    xb, tb = raw_of(server, b)
+    xa = xa * 10 ** (ta["post"]["gain_db"] / 20)  # each part joins at its delivered loudness
+    xb = xb * 10 ** (tb["post"]["gain_db"] / 20)
+    noisy_engine(server, monkeypatch)
+    res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20},
+                                                     {"take": b, "start": 0, "end": 20}],
+                                           "bridge": 2, "blend": 1, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    xf = int(0.1 * SR)
+    assert y.shape[1] == 42 * SR
+    cut = 19 * SR - xf  # part a is itself up to its blend (1 s before its end) minus the crossfade
+    assert np.allclose(y[:, :cut], xa[:, :cut], atol=1e-6)
+    tail = 42 * SR - (23 * SR + xf)  # part b is itself from 1 s past the bridge (+ crossfade)
+    assert np.allclose(y[:, -tail:], xb[:, -tail:], atol=1e-6)
+    assert not np.allclose(y[:, 20 * SR:22 * SR], 0)  # the bridge is the engine's
+
+
+def test_spans_follow_the_player_not_the_raw_take(client, server):
+    x = np.concatenate([np.zeros((2, int(1.5 * 48000)), np.float32), band(100, 12.0, sr=48000)], axis=1)
+    imp = client.post("/api/import", params={"filename": "late.wav"}, content=wav_bytes(x, 48000)).json()
+    t = imp["takes"][0]
+    assert t["post"]["trim_start_s"] == pytest.approx(1.5, abs=0.12)
+    client.post("/api/inpaint", json={"take": t["ref"], "start": 2, "end": 3, "n": 1})
+    job = server._fake.jobs[-1]
+    off = t["post"]["trim_start_s"]
+    assert job["mask_start"] == pytest.approx(2 + off) and job["mask_end"] == pytest.approx(3 + off)
+
+
+def test_spans_on_a_loop_are_refused(client):
+    res = gen(client, n=1, duration=30, bpm=120)
+    client.post("/api/master", json={"request": res["id"], "loop_bars": 4})
+    r = client.post("/api/inpaint", json={"take": res["takes"][0]["ref"], "start": 1, "end": 2})
+    assert r.status_code == 400 and "loop" in r.json()["detail"]
+
+
+def test_a_failed_remaster_changes_nothing(client, server):
+    res = gen(client, n=2, duration=12, bpm=120)
+    d = server.OUTPUT / res["id"]
+    rec = json.loads((d / "request.json").read_text(encoding="utf-8"))
+    rec["takes"][1]["beats"] = []  # this take can't be looped
+    (d / "request.json").write_text(json.dumps(rec), encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in d.iterdir() if p.suffix in (".mp3", ".wav", ".png", ".json")}
+    r = client.post("/api/master", json={"request": res["id"], "loop_bars": 2})
+    assert r.status_code == 400
+    after = {p.name: p.read_bytes() for p in d.iterdir() if p.suffix in (".mp3", ".wav", ".png", ".json")}
+    assert after == before
+
+
+def test_odd_imports_are_4xx_or_rejected_not_500(client):
+    nan = band(100, 3.0, sr=48000)
+    nan[0, 100] = np.nan
+    import io
+
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, nan.T, 48000, format="WAV", subtype="FLOAT")
+    assert client.post("/api/import", params={"filename": "nan.wav"}, content=buf.getvalue()).status_code == 400
+    quiet = np.zeros((1, 3 * 48000), np.float32)
+    quiet[0, 1000] = 0.004  # one click at -48 dBFS
+    r = client.post("/api/import", params={"filename": "quiet.wav"}, content=wav_bytes(quiet, 48000))
+    assert r.status_code == 200 and r.json()["takes"][0]["rejected"]
+
+
+def test_a_mix_span_too_short_is_400(client):
+    a = gen(client, n=1, duration=10)["takes"][0]["ref"]
+    r = client.post("/api/mix", json={"layers": [{"take": a}, {"take": a, "start": 1.0, "end": 1.00001}]})
+    assert r.status_code == 400
+
+
+def test_arrange_joins_parts_at_their_delivered_loudness(client, server):
+    from music import analysis
+    a = gen(client, n=1, duration=20, fade_out=0)["takes"][0]["ref"]
+    quiet = band(110, 20.0, sr=48000) * 0.01  # about -40 dB under the generated part
+    q = client.post("/api/import", params={"filename": "quiet.wav"}, content=wav_bytes(quiet, 48000)).json()
+    res = client.post("/api/arrange", json={"parts": [{"take": a, "start": 0, "end": 20},
+                                                     {"take": q["takes"][0]["ref"], "start": 0, "end": 20}],
+                                           "bridge": 2, "n": 1}).json()
+    y, _ = raw_of(server, res["takes"][0]["ref"])
+    first = analysis.lufs(y[:, 2 * SR:16 * SR], SR)
+    second = analysis.lufs(y[:, 26 * SR:40 * SR], SR)
+    assert abs(first - second) < 3.0  # was ~30 dB apart before
+
+
+def test_extend_continues_from_the_music_not_its_trailing_silence(client, server):
+    x = np.concatenate([band(100, 12.0, sr=48000), np.zeros((2, 6 * 48000), np.float32)], axis=1)
+    imp = client.post("/api/import", params={"filename": "ends-early.wav"}, content=wav_bytes(x, 48000)).json()
+    res = client.post("/api/extend", json={"take": imp["takes"][0]["ref"], "seconds": 10, "n": 1}).json()
+    job = server._fake.jobs[-1]
+    assert job["mask_start"] < 12.5  # the silence isn't part of what it continues
+    assert any("left out" in w for w in res.get("warnings", []))
+    assert res["takes"][0]["signal"]["duration_s"] < 23.0
+
+
+def test_arrange_records_spans_as_the_take_plays(client):
+    x = np.concatenate([np.zeros((2, 3 * 48000), np.float32), band(100, 20.0, sr=48000)], axis=1)
+    imp = client.post("/api/import", params={"filename": "late.wav"}, content=wav_bytes(x, 48000)).json()
+    a = gen(client, n=1, duration=20)["takes"][0]["ref"]
+    res = client.post("/api/arrange", json={"parts": [{"take": imp["takes"][0]["ref"], "start": 2, "end": 14},
+                                                     {"take": a}], "n": 1}).json()
+    assert (res["parts"][0]["start"], res["parts"][0]["end"]) == (pytest.approx(2.0, abs=0.01), pytest.approx(14.0, abs=0.01))

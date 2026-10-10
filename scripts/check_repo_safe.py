@@ -120,6 +120,11 @@ def tracked_files(repo: Path) -> list[Path]:
     return [repo / line for line in out if line.strip()]
 
 
+# Control characters have no business in source or docs; they usually mean an escape went
+# wrong on the way in (a "\a" that became a bell, a "\t" that became a tab inside a path).
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def scan_text(text: str, where: str, problems: list[str]) -> None:
     for label, rx in PATTERNS:
         for m in rx.finditer(text):
@@ -164,6 +169,8 @@ def main() -> int:
             problems.append(f"{rel}: not valid UTF-8 text - is this a binary that slipped through?")
             continue
 
+        for m in CONTROL.finditer(text):
+            problems.append(f"{rel}:{text[:m.start()].count(chr(10)) + 1}: control character {m.group()!r}")
         scan_text(text, rel, problems)
 
     if args.history:

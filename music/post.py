@@ -319,3 +319,62 @@ def process(raw: np.ndarray, sr: int, opts: PostOpts, beats: list[float] | None 
         rep.update(m)
     rep["length_s"] = round(y.shape[1] / SR, 3)
     return y, rep
+
+
+# --------------------------------------------------------------------------- mixing layers
+
+@dataclass
+class Layer:
+    audio: np.ndarray        # (channels, n) at the mix's sample rate
+    gain_db: float = 0.0     # its volume in the mix
+    offset_s: float = 0.0    # where it starts in the mix
+
+
+def mix_layers(layers: list[Layer], sr: int) -> tuple[np.ndarray, dict]:
+    """Layers on top of each other, each at its volume and offset; as long as the longest.
+    Nothing is levelled or ducked: the volumes are the caller's. Unmastered (the caller
+    masters the sum). Returns (mix, report)."""
+    if not layers:
+        raise ValueError("nothing to mix")
+    starts = [int(round(ly.offset_s * sr)) for ly in layers]
+    n = max(s + as2d(ly.audio).shape[1] for s, ly in zip(starts, layers))
+    out = np.zeros((2, n), np.float32)
+    for s, ly in zip(starts, layers):
+        a = as2d(ly.audio)
+        a = np.vstack([a, a]) if a.shape[0] == 1 else a[:2]
+        out[:, s:s + a.shape[1]] += a * 10 ** (ly.gain_db / 20)
+    return out, {"length_s": round(n / sr, 3)}
+
+
+# --------------------------------------------------------------------------- keeping originals
+
+KEEP_XFADE_S = 0.1  # original <-> the engine's audio, just outside the region it was asked to write
+
+
+def keep_outside(x: np.ndarray, r: np.ndarray, m0: int, m1: int, xfade: int) -> np.ndarray:
+    """The engine's output r with the original x put back outside r's masked region [m0, m1).
+
+    The engine re-renders everything it hears, not only what it was asked to write: the same
+    music, but not the same waveform (measured 14-23 dB apart), and a voice comes back as the
+    model's imitation of one. So only [m0, m1) is taken from r; x is kept everywhere else it
+    exists, crossfading linearly over `xfade` samples just outside the mask on each side
+    (linear: both sides there are renderings of the same moment, so an equal-power fade would
+    bump the level by up to 3 dB). x and r share their timeline from sample 0; where x ends
+    (an extension), r carries on. Returns an array as long as r.
+    """
+    x, r = as2d(x), as2d(r)
+    n = r.shape[1]
+    have = min(x.shape[1], n)
+    out = r.copy()
+    a = max(0, min(m0, have) - xfade)
+    out[:, :a] = x[:, :a]
+    if min(m0, have) > a:
+        k = min(m0, have) - a
+        t = np.linspace(0.0, 1.0, k, dtype=np.float32)
+        out[:, a:a + k] = x[:, a:a + k] * (1 - t) + r[:, a:a + k] * t
+    if m1 < have:
+        b = min(m1 + xfade, have)
+        t = np.linspace(0.0, 1.0, b - m1, dtype=np.float32)
+        out[:, m1:b] = r[:, m1:b] * (1 - t) + x[:, m1:b] * t
+        out[:, b:have] = x[:, b:have]
+    return out

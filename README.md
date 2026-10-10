@@ -1,10 +1,14 @@
 # local-music
 
+**Powered by Stability AI** (Stable Audio 3).
+
 A private, fully local **instrumental music generator**, built for AI agents (and people) to
 call. Describe the music (genre, instruments, mood, tempo, key) and get back mastered
 tracks: checked, scored and ranked best-of-N, as 48 kHz WAVs and MP3s, with a waveform,
 loudness and spectrogram picture of each so an agent that can't listen can still judge them.
-Continue a track, make variations, redo a section, or cut a seamless loop on the bar.
+Continue a track, make variations, redo a section, or cut a seamless loop on the bar; start
+from your own audio file; join several takes into one song, with new music written at each
+join; or mix takes on top of each other (a voice over a song), each at its own volume.
 
 It runs **Stable Audio 3 Medium**, the best open-weights model on the
 [Artificial Analysis instrumental leaderboard](https://artificialanalysis.ai/music/leaderboard/instrumental)
@@ -19,9 +23,10 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptModelLicenses   # 
 
 > **Licences, plainly.** This repo's code is MIT. Stable Audio 3 is under the **Stability AI
 > Community License**: free for non-commercial use and for commercial use by individuals and
-> organisations under US$1M a year in revenue (register with Stability first); you own what you
-> generate. It is gated on Hugging Face: accept it there and run `hf auth login` before
-> installing. `-AcceptModelLicenses` says you've read [LICENSE-MODELS.md](LICENSE-MODELS.md).
+> organisations under US$1M a year in revenue (register with Stability first). As between you and
+> Stability, you own what you generate, to the extent the law allows; its Acceptable Use Policy
+> applies, and you may not use the model or its outputs to train other foundation models. It is
+> gated on Hugging Face: accept it there and run `hf auth login` before installing. `-AcceptModelLicenses` says you've read [LICENSE-MODELS.md](LICENSE-MODELS.md).
 > Windows and an NVIDIA GPU are required.
 
 ## For AI agents (Claude Code skill)
@@ -38,6 +43,8 @@ below:
 python scripts\music.py "warm lo-fi hip hop, dusty piano chords, vinyl crackle" --bpm 84 --out D:\music
 python scripts\music.py "8-bit chiptune boss battle" --bpm 160 --loop-bars 8 --out D:\music
 python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
+python scripts\music.py "a warm music box melody" --vary D:\audio\demo.wav --strength 0.5
+python scripts\music.py "a drum fill and a riser" --combine <intro ref> <main ref> <outro ref>
 ```
 
 ## How it works
@@ -46,7 +53,7 @@ python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
    (`TrackType: Music, VocalType: Instrumental`, or `TrackType: Instrument` for a single
    instrument with `--stem`), plus the tempo ("84 BPM") and key ("in A minor") if you give
    them. `--raw` sends the text as written; `--show-prompt` shows what would be sent.
-2. **The takes.** The engine makes N takes (default 3) on consecutive seeds, at 44.1 kHz stereo.
+2. **The takes.** The engine makes N takes (default 4) on consecutive seeds, at 44.1 kHz stereo.
    Its output is kept in full float (the library clamps to full scale, so the worker gives
    the decoder 12 dB of headroom first and takes it back after; no peaks are clipped).
 3. **The checks**, on every take, for a caller that can't listen:
@@ -80,12 +87,74 @@ python scripts\music.py --extend 20261010-153631-080e:84123544 --seconds 60
 |---|---|---|
 | **extend** `--extend REF --seconds S` | hears the take and writes the next S seconds (inpainting past its end) | the whole, longer track |
 | **vary** `--vary REF --strength X` | starts from the take instead of from noise (audio-to-audio): 0.1 is close, 0.5 keeps the style and sound but rewrites the notes, 1 is unrelated | variations, same length |
-| **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span, keeps the rest, joins it musically | the whole track |
+| **inpaint** `--inpaint REF --span 20-28 "a drum fill"` | regenerates that span (seconds as the take plays), joins it musically | the whole track, the rest exactly as it was |
 
 A new text replaces the prompt for that part (default: the source's). Extending past the
-engine's 380 s window works too: it hears the last part of the track and the beginning is put
-back in front, crossfaded over half a second where the original meets the engine's rendering
-of it. (The engine re-renders whatever it hears: the same music, not the same waveform.)
+engine's 380 s window works too: it hears the last part of the track. A fade-out or silence at
+the end of the source is left out first (with a warning): given those, the engine would
+continue the silence.
+
+**Only the new part is the engine's.** The engine re-renders everything it hears, not just
+what it was asked to write: the same music, but not the same waveform (measured 14-23 dB apart),
+and a voice would come back as the model's imitation of one. So the server puts the original
+back everywhere outside the region the engine was asked to write (after the source for extend,
+the span for inpaint, the bridge and blend for joins), with 0.1 s linear crossfades where they
+meet. Tests check this sample for sample. A vary is the exception by nature: it's all new.
+
+### Your own audio
+
+`--import FILE ["what it is"]` (`--stem` if it's one instrument; or **Start from your own audio** on the page) turns a WAV, FLAC,
+OGG or MP3 into a take of an `import` request (seed 0): checked, measured and mastered like a
+generated one, nothing generated. Everything above works from its ref: extend it into a longer
+piece, vary it (timbre or style transfer: a melody played on another instrument at strength
+~0.4-0.6), inpaint a span, loop it, master it, or put it in a song. The description becomes the
+prompt that later work continues from; without one, the engine is led by the audio alone (and
+CLAP has nothing to score). `--extend`, `--vary` and `--inpaint` take a file path directly too
+(imported first). Up to 20 minutes and 300 MB; other formats (M4A, AAC) need converting first.
+What you may do with someone else's recording is up to its licence: the tool doesn't check.
+
+Measured: Windows' `Alarm01.wav` (5.6 s) extended by 40 s as "an upbeat tropical house track
+built around a bright marimba melody" came back as music (CE 7.4, PQ 8.4); varied at 0.5 as
+"a warm music box melody", its CLAP match to that description rose from 0.37 to 0.45.
+
+### Mixing takes on top of each other
+
+`--mix SONG:1,vol=-8 VOICE:0,at=4` (or **Mix on top** in the page's Song tray) layers takes: each
+is the take's delivered track (what you hear: mastered, or its loop), at its own volume
+(`vol=`, dB, default 0) starting at its own time (`at=`, seconds, default 0), optionally a span
+(`REF@10-40`). The mix runs as long as its longest layer. Nothing levels or ducks the layers:
+the balance is yours. The sum is mastered like any take (so the overall loudness is the usual
+-14 LUFS and the volumes set the balance between layers), and it's a take itself: extend it,
+loop it, re-master it, or mix it again. A voice is usually imported first (`--import
+voice.mp3`); at 0 dB both layers sit at the same loudness, so a voice over a busy song
+typically wants the song at -6 to -12.
+
+### Joining takes into one song
+
+`--combine A B C` (or **Add to song** on takes, then **Combine** on the page) joins takes in
+order. At each join the engine hears up to 20 s of the part before and after, writes `--bridge`
+seconds of new music between them (default 2 bars at the first part's tempo, 4 s without one;
+0 blends the parts straight into each other) and rewrites `--blend` seconds (default 1) of each
+part beside it so they flow into it. Everything else is the parts' own audio, sample for
+sample, each brought to its delivered loudness first (an imported recording joins as loud as it
+plays on its own). The text describes the bridges
+("a big drum fill and a rising synth sweep"; default: the first part's prompt).
+
+- A part can be a span of a take: `REF@20-60` (seconds as the take plays, as on its picture;
+  `REF@30-` from 30 s to the end). Spans can't be taken from a take delivered as a loop.
+- At inner joins a part is cut to its *body*: a fade-out, a final chord dying away or silence
+  before a join (and a fade-in after one) would tell the engine the music had ended, and it
+  wrote silent bridges. A span you give sets that edge yourself; the song's very start and end
+  stay as they are.
+- Parts at different tempos or in unrelated keys get a warning: the bridge has to change
+  them, and may sound abrupt. Generating the parts with the same `--bpm` and `--key` avoids it.
+- Each take of the result is the whole song, its bridges made with one seed (a few seconds per
+  join), then checked, scored and mastered like any take.
+
+Measured: an intro (pads, no drums), a main part (drums, bass, lead) and an outro, each made
+separately at 100 BPM, joined with "a big drum fill and a rising synth sweep": 109 s at 100.0
+BPM, CE 7.4, PQ 8.2, no warnings; the drums build in across the first bridge, and the bar grid
+runs through both joins unbroken.
 
 ### Re-mastering
 
@@ -173,7 +242,7 @@ python scripts\music.py --settings
 | `--duration S` | 2-380 s on Medium, 2-120 on Small (default 30). |
 | `--bpm N` / `--key K` | Added to the prompt and checked in the result. Keys: `A minor`, `F# major`, `Bbm`... The model follows the key on clearly tonal music (a solo piano in E minor came out in E minor 3 times out of 3); busy or jazzy harmony reads as "unclear". |
 | `--stem` | One instrument or part instead of a full arrangement. |
-| `--n N` | Takes to make and rank (default 3, max 8). |
+| `--n N` | Takes to make and rank (default 4, max 8). |
 | `--seed N` / `--seeds A,B` | Start seed (takes use N, N+1...) or exact seeds; `random` by default. |
 | `--engine medium\|small` | Medium (default) or Small-Music (installed with `-WithSmall`). |
 | `--raw` | Send the text as written: no tags, tempo or key added. |
@@ -182,11 +251,15 @@ python scripts\music.py --settings
 | `--fade-in S` / `--fade-out S` | Fades. `--fade-out` unset means auto (3 s, only when the take stops at full level); `0` keeps a hard cut. |
 | `--lufs X` / `--peak X` | Loudness target (default -14; -16 to -18 sits under dialogue) and true-peak ceiling (default -1 dBTP). |
 | `--loop-bars N` / `--beats-per-bar N` | Deliver a seamless loop of N bars (give `--bpm` when generating so the take is long enough); 4 beats per bar by default. |
-| `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take (above). |
+| `--extend REF --seconds S`, `--vary REF --strength X`, `--inpaint REF --span A-B` | From an earlier take, or an audio file (above). |
+| `--import FILE` | Your own audio as a take; the text describes it. |
+| `--combine PART PART...`, `--bridge S`, `--blend S` | Join takes into one song; parts are `REF` or `REF@START-END`. Put the text before `--combine`. |
+| `--mix LAYER LAYER...` | Takes on top of each other: `REF[@START-END][,vol=DB][,at=SECONDS]`. |
 | `--master REQ` | Re-master a request with the mastering flags; `--no-loop`, `--full-length` undo a loop or a cut. |
 | `--out DIR` | Copy the best take (`--best N`, `--all`) as `<name>_vNN.wav` + `.mp3` + `.json` sidecar (`--format wav\|mp3`, `--png` for the plots, `--name` to rename). Never overwrites. |
 | `--play`, `--no-save`, `--json`, `--wait S` | Play the best take; delete the request afterwards; print the server's JSON; wait for the server. |
-| `--show-prompt`, `--list`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up. |
+| `--show-prompt`, `--list`, `--show REQ`, `--settings`, `--engines`, `--delete REQ` | Inspect and tidy up (`--show`: an earlier request's takes and files). |
+| `--save-defaults` / `--reset-defaults` | Save the options given with it (`--n`, `--duration`, `--lufs`, `--fade-out`...) as your defaults, merged with what's saved; or forget them. The page's **Save as my defaults** does the same. |
 
 A take's **ref** is `<request id>:<seed>`. Exit codes: 0 done, 1 no server or failed, 2 bad
 arguments, 3 every take was rejected.
@@ -208,6 +281,9 @@ full output goes to `logs\server.log`, timestamped. Each start keeps the previou
 | `POST /api/extend` | `{"take", "seconds"?, "text"?, + shape and mastering}` | the same, for the longer track |
 | `POST /api/vary` | `{"take", "strength"?, "text"?, ...}` | variations |
 | `POST /api/inpaint` | `{"take", "start", "end", "text"?, ...}` | the take with that span redone |
+| `POST /api/import?filename=&text=&kind=&name=&check=` | the file's bytes (`application/octet-stream`) | an `import` request with one take (seed 0) |
+| `POST /api/mix` | `{"layers": [{"take", "gain_db"?, "at"?, "start"?, "end"?}, ...], "name"?, "check"?, + mastering}` | the mix, as one take (seed 0) |
+| `POST /api/arrange` | `{"parts": [{"take", "start"?, "end"?}, ...], "bridge"?, "blend"?, "text"?, "name"?, + shape and mastering}` | the song, as takes |
 | `POST /api/master` | `{"request", "length"?, "fade_in"?, "fade_out"?, "lufs"?, "peak_dbtp"?, "loop_bars"?, "beats_per_bar"?, "bpm"?}` | the request, re-mastered (`null` clears `length` / `loop_bars`) |
 | `GET /api/requests`, `GET /api/requests/<id>`, `DELETE /api/requests/<id>` | | list, one, delete |
 | `GET /api/prompt?text=&bpm=&key=&kind=&raw=` | | the prompt and file name a request would use |
@@ -235,8 +311,11 @@ Every request is a folder `output\<id>\` (clear it any time):
 
 http://127.0.0.1:8192/ does the same: the description, seconds, BPM, key and kind up front,
 mastering and fine-tuning folded away, then one card per take with its scores, tempo and key,
-player, picture, downloads, and **Extend / Vary / Inpaint**; per request, **Re-master**,
-**Make loops** and **delete**. `Ctrl+Enter` generates.
+player, picture, downloads, **Add to song**, and **Extend / Vary / Inpaint**; per request,
+**Re-master**, **Make loops** and **delete**. On the left, **Start from your own audio** imports
+a file, and **Song** lists the takes you added: **Join in order** (reorder, trim each to a
+span, set the bridge, **Combine**) or **Mix on top** (a volume slider and a start time per
+layer, double-click a slider for 0 dB, **Mix**). `Ctrl+Enter` generates.
 
 ### Speed (RTX 5080)
 

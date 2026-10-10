@@ -1,11 +1,11 @@
 ---
 name: local-music
-description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
+description: Generate instrumental music locally with Stable Audio 3 Medium on this machine's GPU: full tracks or single-instrument stems from a description (genre, instruments, mood, tempo, key), up to 6 min 20 s, for games, videos, animations, podcasts and menus; or start from the user's own audio file (continue it, restyle it), or join several takes into one song with bridges written between them, or mix takes on top of each other (a voice over a song) at set volumes. Every take is checked automatically (silence, clipping, dropouts, abrupt ends; tempo and key against what was asked; CLAP prompt match; Audiobox enjoyment and production quality), ranked best-of-N and mastered to -14 LUFS / -1 dBTP; takes can be extended, varied, partly regenerated, re-mastered or cut into seamless loops on the bar, and are delivered as WAV + MP3 to a folder the user names. Use when the user asks for music, a soundtrack, a background track, a loop, a jingle bed or a stem made locally or without a cloud service. Not for songs with lyrics, speech or sound effects.
 ---
 
 # local-music: instrumental music on the local GPU
 
-You describe the music; the server makes N takes (default 3), checks, scores and ranks them,
+You describe the music; the server makes N takes (default 4), checks, scores and ranks them,
 masters them, and hands back WAV + MP3 files with a picture of each (waveform, loudness over
 time, spectrogram with the bar grid).
 
@@ -26,7 +26,7 @@ M=~/.claude/skills/local-music/scripts/music.py
 $PY $M "A warm lo-fi hip hop beat with dusty piano chords, soft vinyl crackle and a laid-back boom bap groove" --bpm 84 --duration 60 --wait 180 --out <dir>
 ```
 
-That makes 3 takes, prints them ranked with scores, tempo, key and PNG paths, and copies the
+That makes 4 takes, prints them ranked with scores, tempo, key and PNG paths, and copies the
 best to `<dir>` as `warm-lofi-hip-hop_v01.wav` + `.mp3` + a `.json` sidecar. Read the PNG of
 the top take. Send files with SendUserFile if you have it (the MP3 plays inline); otherwise
 give the paths.
@@ -109,8 +109,16 @@ $PY $M --vary <ref> --strength 0.3 --n 4                        # variations of 
 $PY $M --inpaint <ref> --span 20-28 "a drum fill"              # redo that span, keep the rest
 $PY $M --master <request id> --loop-bars 4                      # re-master: no regeneration
 $PY $M --master <request id> --no-loop --fade-out 5 --lufs -16
+$PY $M --import <file> "a slow acoustic folk song"            # the user's audio as a take (ref <id>:0)
+$PY $M "a warm music box melody" --vary <file> --strength 0.5    # files work directly too
+$PY $M "a big drum fill and a riser" --combine <intro ref> <main ref>@0-40 <outro ref>   # one song
+$PY $M --mix <song ref>,vol=-9 <voice ref>,at=4                 # a voice over a song (import the voice first)
 $PY $M --show-prompt "dark synthwave" --bpm 100                 # what the engine would get
-$PY $M --list          $PY $M --settings          $PY $M --engines
+$PY $M --list
+$PY $M --show <request id>
+$PY $M --settings
+$PY $M --engines
+$PY $M --save-defaults --n 6 --lufs -16       # only when the user asks for new defaults; --reset-defaults undoes
 ```
 
 A **ref** is `<request id>:<seed>`, printed for every take. `--json` prints the server's full
@@ -121,7 +129,7 @@ response (plus `delivered`): parse that rather than the text.
 | `--duration S` | 2-380 s (default 30). Pick what the use needs: a menu loop 20-40 s, a level track 2-4 min. |
 | `--bpm N`, `--key K` | Added to the prompt and checked. Ask for a tempo whenever it matters (loops, editing to picture). |
 | `--stem` | One instrument or part ("a drum loop", "solo cello") instead of a full arrangement. |
-| `--n N` | Takes (default 3, max 8). Generation is cheap (seconds); checks take a few seconds per minute of music. |
+| `--n N` | Takes (default 4, max 8). Generation is cheap (seconds); checks take a few seconds per minute of music. |
 | `--seed N` / `--seeds A,B` | Reproduce takes. |
 | `--length S`, `--fade-in S`, `--fade-out S` | Cut, fades. `--fade-out` unset = automatic (3 s, only if the take stops at full level); `0` keeps a hard cut. |
 | `--lufs X`, `--peak X` | Loudness (default -14 LUFS: music on its own; -16 to -20 under dialogue or as a background bed) and true-peak ceiling (default -1 dBTP). |
@@ -191,10 +199,25 @@ the user wanted a build, or an empty band (no bass, no highs) that contradicts t
   rewrites details; 0.5-0.7 rewrites the notes; a new text steers the variation.
 - **Longer**: `--extend <ref> --seconds S` (repeatable; past 380 s it continues from the last
   part). The result is the whole track.
-- **One bad section**: `--inpaint <ref> --span A-B` (seconds on the take's timeline), with a
-  new text for that part if wanted ("a drum break", "the strings drop out").
+- **One bad section**: `--inpaint <ref> --span A-B` (seconds as the take plays: read them off its PNG), with a
+  new text for that part if wanted ("a drum break", "the strings drop out"). Everything outside the span stays
+  exactly as it was (the same holds for extend and for the parts of a combine).
 - **Different length, loudness, fades, or a loop**: `--master <request id> ...`, no
   regeneration.
+- **From the user's own audio**: `--import <file> "what it is"`, then work from its ref; or pass
+  the file to `--extend` / `--vary` / `--inpaint`. A melody on another instrument: `--vary` at
+  0.4-0.6 with the new instrument as the text. Don't import recordings the user has no right to
+  rework without saying so.
+- **A song from sections**: make each part separately with the **same `--bpm` and `--key`**
+  (an intro without drums, a main part, a breakdown, an outro), then `"<what the bridges
+  are>" --combine A B C` (text first). Bridges default to 2 bars; `--bridge 0` blends parts
+  straight into each other. Parts are cut to their body at the joins (fades and silence would
+  make silent bridges); `REF@START-END` picks a span yourself. Read the result's PNG at each
+  join: the bar grid should run through, the loudness shouldn't fall into a hole.
+- **A voice (or any layer) over a song**: `--import voice.mp3`, then `--mix <song ref>,vol=-9
+  <voice ref>,at=4`. Each layer is at the volume you give (default 0 dB, both at the same
+  loudness); nothing is ducked or levelled for you: the user decides the balance, so ask, or
+  offer two or three balances (song at -6 / -9 / -12) rather than picking one silently.
 
 ## 6. Delivering
 

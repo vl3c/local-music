@@ -142,3 +142,17 @@ def test_mp3_is_stereo_and_about_320_kbps(tmp_path):
     info = sf.info(str(p))
     assert info.channels == 2 and info.samplerate == 48000
     assert 280 < p.stat().st_size * 8 / 4.0 / 1000 < 360
+
+
+def test_float_wavs_keep_peaks_over_full_scale(tmp_path):
+    x = band(120, 1.0) * 6  # peaks around 1.5
+    y, _ = audio.read(audio.write_wav(tmp_path / "f.wav", x, SR, subtype="FLOAT"))
+    assert np.max(np.abs(y)) > 1.2 and checks.clipped_fraction(y) == 0.0
+    z, _ = audio.read(audio.write_wav(tmp_path / "i.wav", x, SR))  # 24-bit: clamped, not wrapped
+    assert np.max(np.abs(z)) <= 1.0
+
+
+def test_imported_file_names():
+    assert prompts.file_name("20261010171131-44b6_fx-demon_room") == "fx-demon-room"
+    assert prompts.file_name("My Song (final mix) v2") == "my-song-final-mix"
+    assert prompts.file_name("2026-10-10 12-00") == "audio"

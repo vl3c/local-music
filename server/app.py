@@ -6,7 +6,7 @@ Audiobox Aesthetics) and does all analysis and mastering, so every take is judge
 
     start.cmd   (the server runs only in the console window start.cmd opens)
 
-A request makes N takes (best-of-N, default 3) on consecutive seeds, checks and scores each,
+A request makes N takes (best-of-N, default 4) on consecutive seeds, checks and scores each,
 rejects the broken ones and returns them all ranked. Its files live in output/<id>/:
 
     request.json         the request, the prompt actually sent, and every take's scores
@@ -16,14 +16,17 @@ rejects the broken ones and returns them all ranked. Its files live in output/<i
     <seed>.png           waveform, loudness and spectrogram with the bar grid
 
 Kinds of request: generate (text to music), extend (continue a take), vary (a variation
-of a take: audio to audio) and inpaint (regenerate a span of a take). /api/master re-masters
-a request's takes (length, fades, loudness, loop) without regenerating.
+of a take: audio to audio), inpaint (regenerate a span of a take), import (your own audio
+file, as a take the others can start from), arrange (several takes in order, with a bridge
+written between each two) and mix (takes on top of each other, each at its own volume). /api/master re-masters a request's takes (length, fades,
+loudness, loop) without regenerating.
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import io
 import json
 import os
 import queue
@@ -50,13 +53,18 @@ SETTINGS_FILE = REPO / "config.local.json"
 sys.path.insert(0, str(REPO))
 # Everything is loaded from models/: never let a library reach for the network.
 for _k, _v in {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
-               "DO_NOT_TRACK": "1", "TRANSFORMERS_VERBOSITY": "error"}.items():
+               "DO_NOT_TRACK": "1", "TRANSFORMERS_VERBOSITY": "error",
+               # The Intel Fortran runtime that comes with torch's maths libraries installs its own
+               # console handler, which aborts the process when the window closes ("forrtl: error
+               # (200)") before anything else can run. Off: the server's own handler cleans up instead.
+               "FOR_DISABLE_CONSOLE_CTRL_HANDLER": "1"}.items():
     os.environ[_k] = _v
 
 import uvicorn  # noqa: E402
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
 import serverlog  # noqa: E402  (server/, on sys.path as the script's folder)
@@ -95,6 +103,14 @@ async def _same_origin_only(request, call_next):
 def _own_origins(request) -> set[str]:
     port = request.url.port or 80
     return {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+
+
+@app.exception_handler(PermissionError)
+async def _file_in_use(request, exc):
+    # Windows won't replace or delete a file another handle has open: the browser still
+    # streaming a take's MP3, an editor holding a WAV. audio.replace() retries for a while first.
+    return JSONResponse({"detail": f"a file is in use ({exc.filename or exc}): stop playing or downloading it, "
+                                   "then try again"}, status_code=409)
 
 
 _lock = threading.Lock()  # one GPU job at a time: generation and scoring share the card
@@ -251,7 +267,7 @@ def _release_cache() -> None:
 # (gitignored) and override them for the page and for every request that leaves a key out.
 REPO_DEFAULTS = {
     "engine": "medium",
-    "n": 3,                   # best-of-N
+    "n": 4,                   # best-of-N
     "seed": None,             # None: a random start seed; takes use seed, seed+1, ...
     "steps": None,            # None: the engine's default (8)
     "duration": 30.0,         # seconds
@@ -431,7 +447,7 @@ def save_request(rec: dict) -> None:
     p = req_dir(rec["id"]) / "request.json"
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, p)
+    audio.replace(tmp, p)
 
 
 def parse_take(ref: str) -> tuple[str, int]:
@@ -488,18 +504,21 @@ def analyse(rec: dict, take: dict, x: np.ndarray, sr: int) -> None:
     take["music"] = mus
 
 
-def render(rec: dict, take: dict, opts: post.PostOpts) -> np.ndarray:
-    """Raw -> mastered audio + MP3 for one take. Updates take["post"] / ["final"]. Returns the audio.
+def master_take(rec: dict, take: dict, opts: post.PostOpts) -> tuple[np.ndarray, dict]:
+    """Raw -> mastered audio and its report, for one take. No side effects (so a request's takes
+    can all be mastered before anything is written, and a failure leaves them as they were);
+    thread-safe (numpy, soxr)."""
+    raw, sr = audio.read(req_dir(rec["id"]) / take["raw"])
+    return post.process(raw, sr, opts, take.get("beats"))
 
-    Thread-safe (numpy, soxr and libsndfile), so a request's takes render in parallel; the
-    plot (matplotlib isn't thread-safe) is draw()'s job, afterwards."""
-    d = req_dir(rec["id"])
-    raw, sr = audio.read(d / take["raw"])
-    y, rep = post.process(raw, sr, opts, take.get("beats"))
+
+def commit_take(rec: dict, take: dict, y: np.ndarray, rep: dict) -> None:
+    """Store a mastered take: its report in the record, its MP3 on disk (the WAV is written by
+    judge(), with the scores in its INFO chunk). Thread-safe (libsndfile)."""
+    rep = dict(rep)
     take["final"] = {"true_peak_dbtp": rep.pop("true_peak_dbtp"), "lufs": rep.pop("lufs")}
     take["post"] = rep
-    audio.write_mp3(d / take["mp3"], y)
-    return y
+    audio.write_mp3(req_dir(rec["id"]) / take["mp3"], y)
 
 
 def draw(rec: dict, take: dict, opts: post.PostOpts, y: np.ndarray) -> None:
@@ -515,14 +534,21 @@ def draw(rec: dict, take: dict, opts: post.PostOpts, y: np.ndarray) -> None:
 
 
 def render_all(rec: dict, opts: post.PostOpts, prepare=None) -> list[np.ndarray]:
-    """Render every take of a request, in parallel, then draw their plots. prepare(take), if
-    given, runs first in the take's thread (the analysis of a new take)."""
+    """Master every take of a request in parallel and only then write anything, so one take
+    failing to master (a loop longer than it, say) leaves every take as it was; then the MP3s
+    and the plots. (A file locked while they're written, the browser playing it, still stops
+    part-way: a 409, some takes rewritten; running it again finishes the job.) prepare(take),
+    if given, runs first in the take's thread (a new take's analysis)."""
     def one(t):
         if prepare is not None:
             prepare(t)
-        return render(rec, t, opts)
-    with ThreadPoolExecutor(max_workers=min(4, len(rec["takes"])) or 1) as ex:
-        finals = list(ex.map(one, rec["takes"]))
+        return master_take(rec, t, opts)
+    n = min(4, len(rec["takes"])) or 1
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        done = list(ex.map(one, rec["takes"]))  # raises before anything is written
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(lambda tr: commit_take(rec, tr[0], *tr[1]), zip(rec["takes"], done)))
+    finals = [y for y, _ in done]
     for t, y in zip(rec["takes"], finals):
         draw(rec, t, opts, y)
     return finals
@@ -534,7 +560,10 @@ def judge(rec: dict, takes: list[dict], finals: list[np.ndarray], check: bool) -
     if check:
         try:
             # An inpainted take is mostly its source: judge it against the source's description.
-            cl = clap().score(finals, audio.SR, prompts.describe(rec.get("clap_prompt") or rec["prompt"]))
+            # Nothing to match without one (an imported track nobody described).
+            text = prompts.describe(rec.get("clap_prompt") or rec["prompt"]) if (rec.get("clap_prompt") or
+                                                                                rec["prompt"]) else ""
+            cl = clap().score(finals, audio.SR, text) if text else [{} for _ in finals]
             ae = aes().score(finals, audio.SR)
             for t, c, a in zip(takes, cl, ae):
                 t.update(c)
@@ -587,8 +616,8 @@ def take_view(rec: dict, take: dict) -> dict:
 
 def request_view(rec: dict) -> dict:
     keep = ("id", "created", "op", "kind", "text", "prompt", "negative", "raw", "bpm", "key", "name", "engine",
-            "model", "seeds", "steps", "duration", "source", "seconds", "strength", "span", "post",
-            "gen_length_s", "gen_s", "score_s", "warnings")
+            "model", "seeds", "steps", "duration", "source", "seconds", "strength", "span", "parts", "bridge",
+            "blend", "layers", "post", "gen_length_s", "gen_s", "score_s", "warnings")
     out = {k: rec[k] for k in keep if k in rec}
     out["takes"] = [take_view(rec, t) for t in rec["takes"]]
     out["kept"] = sum(not t.get("rejected") for t in rec["takes"])
@@ -612,21 +641,32 @@ def _start(engine: str) -> Worker:
         raise HTTPException(503, f"engine {engine} failed to start: {exc} (see logs/server.log)") from exc
 
 
+def _call(rec: dict, job: dict, w: Worker) -> dict:
+    """Send one job to the engine. On failure the request's folder goes and it's a 500."""
+    try:
+        return w.call(job)
+    except Exception as exc:
+        shutil.rmtree(req_dir(rec["id"]), ignore_errors=True)
+        print(f"[local-music] generation FAILED: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(500, f"generation failed: {type(exc).__name__}: {exc}") from exc
+
+
 def _run(rec: dict, job: dict, w: Worker, opt: dict, stitch=None) -> dict:
     """Send the job, turn the worker's files into checked, mastered, ranked takes. Call with _lock held.
 
     stitch(raw) -> raw: for extensions longer than the engine's window, puts the earlier part
     of the source back in front of what the engine returned.
     """
-    d = req_dir(rec["id"])
     t0 = time.time()
-    try:
-        reply = w.call(job)
-    except Exception as exc:
-        shutil.rmtree(d, ignore_errors=True)
-        print(f"[local-music] generation FAILED: {type(exc).__name__}: {exc}", flush=True)
-        raise HTTPException(500, f"generation failed: {type(exc).__name__}: {exc}") from exc
+    reply = _call(rec, job, w)
     rec["gen_s"] = round(time.time() - t0, 2)
+    return _finish(rec, reply, opt, stitch)
+
+
+def _finish(rec: dict, reply: dict, opt: dict, stitch=None) -> dict:
+    """The engine's files ({"files": [{"seed", "path"}]}) -> checked, mastered, ranked takes,
+    saved; the request as the API returns it. Call with _lock held."""
+    d = req_dir(rec["id"])
     try:
         t1 = time.time()
         opts = post.PostOpts(**rec["post"])
@@ -709,6 +749,16 @@ def _source(ref: str) -> tuple[dict, dict, Path]:
     return src, take, req_dir(rid) / take["raw"]
 
 
+def _raw_offset(src: dict, take: dict, ref: str) -> float:
+    """Where the delivered track (what the player and the plot show) starts on the raw take's
+    timeline: spans are given in the former and cut from the latter. A loop has no single
+    mapping, so spans on one are refused."""
+    if take.get("post", {}).get("loop") is not None:
+        raise HTTPException(400, f"{ref} is delivered as a loop: give a span only on a whole track "
+                                 "(re-master it with loop_bars null first)")
+    return float(take.get("post", {}).get("trim_start_s", 0.0))
+
+
 def _from_take(req: FromTakeReq, op: str, **fields):
     """The shared part of extend / vary / inpaint: resolve settings, the source and its prompt."""
     saved = local_settings()
@@ -731,11 +781,19 @@ def _from_take(req: FromTakeReq, op: str, **fields):
 
 @app.post("/api/extend")
 def extend(req: ExtendReq):
-    """Continue a take: the engine hears it and writes what comes next. The result is the
-    whole track (source + new music). Past the engine's window (380 s for Medium), it hears
-    the end of the source only, and the beginning is put back in front, crossfaded."""
+    """Continue a take: the engine hears it (its last part, past the engine's 380 s window) and
+    writes what comes next. The result is the whole track: the source exactly as it was, then
+    the new music, crossfaded over 0.1 s where they meet."""
     opt, src, raw_path, common = _from_take(req, "extend")
     x, sr = audio.read(raw_path)
+    # Continue from the music's body: given a fade-out or silence to continue, the engine
+    # continues it (a silent extension), and the gap would stay inside the result.
+    end = analysis.body(x, sr)[1]
+    trimmed = x.shape[1] - end
+    if trimmed > int(0.5 * sr):
+        x = x[:, :end]
+    else:
+        trimmed = 0
     src_s = x.shape[1] / sr
     with _lock:
         engine = opt["engine"] or src["engine"]
@@ -748,24 +806,23 @@ def extend(req: ExtendReq):
         rec = _new_record("extend", opt, info, engine, seeds, seconds=req.seconds,
                           duration=round(src_s + req.seconds, 2), gen_length_s=round(context_s + req.seconds, 2),
                           **common)
+        if trimmed:
+            rec["warnings"] = [f"the source's last {trimmed / sr:.1f} s (a fade-out or silence) were left out: "
+                               "the new music continues from where the source was still playing"]
         d = req_dir(rec["id"])
-        stitch = None
+        # The engine hears the last context_s of the source (all of it, if it fits) and writes
+        # what follows. It re-renders what it heard, too: the source is put back in front.
+        cut_n = x.shape[1] - int(round(context_s * sr))
+        head, ctx = x[:, :cut_n], x[:, cut_n:]
         ctx_path = raw_path
-        if context_s < src_s:
-            cut = x.shape[1] - int(context_s * sr)
-            head, ctx = x[:, :cut], x[:, cut:]
+        if cut_n > 0:
             ctx_path = d / "context.wav"
             audio.write_wav(ctx_path, ctx, sr, subtype="FLOAT")
-            xf = min(int(0.5 * sr), ctx.shape[1])
+        xf = int(post.KEEP_XFADE_S * sr)
 
-            def stitch(y: np.ndarray, ysr: int, head=head, ctx=ctx, xf=xf) -> np.ndarray:
-                # The engine re-renders the context it heard: the same music, but not the same
-                # waveform (measured -14 to -23 dB apart). Keep the original up to where the
-                # context starts, then cross from the original context into its rendering over
-                # half a second; from there on it's all the engine's.
-                t = np.linspace(0.0, np.pi / 2, xf, dtype=np.float32)
-                seam = ctx[:, :xf] * np.cos(t) + y[:, :xf] * np.sin(t)
-                return np.concatenate([head, seam, y[:, xf:]], axis=1)
+        def stitch(y: np.ndarray, ysr: int, head=head, ctx=ctx, xf=xf) -> np.ndarray:
+            n = ctx.shape[1] + int(round(req.seconds * ysr))
+            return np.concatenate([head, post.keep_outside(ctx, _fit(y, n), ctx.shape[1], n, xf)], axis=1)
         job = {"op": "generate", "prompt": rec["prompt"], "duration": context_s + req.seconds, "seeds": seeds,
                "steps": rec["steps"], "out_dir": str(d), "stem": "gen", "inpaint_audio": str(ctx_path),
                "mask_start": context_s, "mask_end": context_s + req.seconds}
@@ -788,20 +845,30 @@ def vary(req: VaryReq):
         length = min(x.shape[1] / sr, w.info["max_duration"])
         rec = _new_record("vary", opt, w.info, engine, seeds, strength=strength, duration=round(length, 2),
                           gen_length_s=round(length, 2), **common)
+        init = raw_path
+        if x.shape[1] / sr > length:  # longer than the engine's window: vary its first part
+            init = req_dir(rec["id"]) / "init.wav"
+            audio.write_wav(init, x[:, :int(length * sr)], sr, subtype="FLOAT")
+            rec["warnings"] = [f"the source is {x.shape[1] / sr:.0f} s: only its first {length:.0f} s (the engine's "
+                               "window) were varied"]
         job = {"op": "generate", "prompt": rec["prompt"], "duration": length, "seeds": seeds, "steps": rec["steps"],
-               "out_dir": str(req_dir(rec["id"])), "stem": "gen", "init_audio": str(raw_path),
+               "out_dir": str(req_dir(rec["id"])), "stem": "gen", "init_audio": str(init),
                "init_strength": strength}
-        return _run(rec, job, w, opt)
+        out = _run(rec, job, w, opt)
+        (req_dir(rec["id"]) / "init.wav").unlink(missing_ok=True)
+        return out
 
 
 @app.post("/api/inpaint")
 def inpaint(req: InpaintReq):
-    """Regenerate start..end (seconds, on the take's raw timeline) and keep the rest."""
+    """Regenerate start..end (seconds, as the take plays) and keep the rest as it was."""
     opt, src, raw_path, common = _from_take(req, "inpaint")
     x, sr = audio.read(raw_path)
     total = x.shape[1] / sr
-    if not req.start < req.end <= total + 1e-6:
-        raise HTTPException(400, f"the span must lie within the take (0..{total:.1f} s), start before end")
+    off = _raw_offset(src, find_take(src, parse_take(req.take)[1]), req.take)
+    start, end = req.start + off, req.end + off
+    if not start < end <= total + 1e-6:
+        raise HTTPException(400, f"the span must lie within the take (0..{total - off:.1f} s), start before end")
     with _lock:
         engine = opt["engine"] or src["engine"]
         w = _start(engine)
@@ -812,8 +879,312 @@ def inpaint(req: InpaintReq):
                           gen_length_s=round(total, 2), clap_prompt=src["prompt"], **common)
         job = {"op": "generate", "prompt": rec["prompt"], "duration": total, "seeds": seeds, "steps": rec["steps"],
                "out_dir": str(req_dir(rec["id"])), "stem": "gen", "inpaint_audio": str(raw_path),
-               "mask_start": req.start, "mask_end": req.end}
-        return _run(rec, job, w, opt)
+               "mask_start": start, "mask_end": end}
+        m0, m1, xf = int(round(start * sr)), int(round(end * sr)), int(post.KEEP_XFADE_S * sr)
+
+        def stitch(y: np.ndarray, ysr: int) -> np.ndarray:
+            # Only the span is the engine's: everything else is the take as it was.
+            return post.keep_outside(x, _fit(y, x.shape[1]), m0, m1, xf)
+        return _run(rec, job, w, opt, stitch)
+
+
+# --------------------------------------------------------------------------- your own audio
+
+MAX_IMPORT_BYTES = 300 * 2**20
+MAX_IMPORT_S = 1200.0
+
+
+@app.post("/api/import")
+async def import_audio(request: Request, filename: str = Query(min_length=1, max_length=200),
+                       text: str | None = Query(None, max_length=1000), kind: Literal["music", "stem"] = "music",
+                       name: str | None = Query(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$"),
+                       check: bool | None = None):
+    """Your own audio file (the request body, as raw bytes: WAV, FLAC, OGG or MP3) becomes a
+    take (seed 0) of an "import" request: checked, measured and mastered like any other, so
+    extend, vary, inpaint, arrange and master all work from its ref. `text` describes it
+    (it becomes the prompt that work continues from; without it the engine is led by the
+    audio alone)."""
+    size = int(request.headers.get("content-length") or 0)
+    if size > MAX_IMPORT_BYTES:
+        raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
+    data = bytearray()
+    async for chunk in request.stream():  # counted as it arrives: a chunked upload has no length
+        data += chunk
+        if len(data) > MAX_IMPORT_BYTES:
+            raise HTTPException(413, f"the file is over {MAX_IMPORT_BYTES // 2**20} MB")
+    if not data:
+        raise HTTPException(400, "no audio in the request body")
+    data = bytes(data)
+    return await run_in_threadpool(_import, data, filename, text, kind, name, check)
+
+
+def _import(data: bytes, filename: str, text: str | None, kind: str, name: str | None, check: bool | None) -> dict:
+    import soundfile as sf
+    base = Path(filename.replace("\\", "/")).name or "audio"
+    warnings = []
+    try:
+        with sf.SoundFile(io.BytesIO(data)) as f:
+            sr = f.samplerate
+            keep = int(MAX_IMPORT_S * sr)
+            if f.frames > keep:  # decode only what's kept: a long FLAC is gigabytes as float
+                warnings.append(f"only the first {MAX_IMPORT_S / 60:.0f} minutes were imported")
+            # In blocks, two channels kept: an 8-channel 384 kHz file mustn't decode whole first.
+            blocks, got = [], 0
+            want = min(f.frames, keep) if f.frames > 0 else keep
+            while got < want:
+                blk = f.read(min(10 * sr, want - got), dtype="float32", always_2d=True)
+                if not len(blk):
+                    break
+                blocks.append(blk[:, :2].copy())
+                got += len(blk)
+            x = np.concatenate(blocks) if blocks else np.zeros((0, 1), np.float32)
+    except Exception as exc:
+        raise HTTPException(400, f"can't read {base!r} as audio ({exc}). WAV, FLAC, OGG and MP3 work; "
+                                 "convert other formats (M4A, AAC...) first") from exc
+    if not np.all(np.isfinite(x)):
+        raise HTTPException(400, f"{base!r} has samples that aren't numbers (NaN or infinity): it's damaged")
+    x = np.ascontiguousarray(x.T)
+    x = np.vstack([x, x]) if x.shape[0] == 1 else x[:2]
+    if x.shape[1] < sr:
+        raise HTTPException(400, f"{base!r} is shorter than a second")
+    x = audio.resample(x, sr, RAW_SR)
+    text = " ".join(text.split()) if text else ""
+    opt = effective_settings()
+    if check is not None:
+        opt["check"] = check
+    prompt = prompts.build_prompt(text, kind=kind) if text else ""
+    with _lock:
+        rid = new_id()
+        d = OUTPUT / rid
+        d.mkdir(parents=True)
+        rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "import", "engine": opt["engine"],
+               "model": "imported", "seeds": [0], "steps": None, "takes": [], "kind": kind, "text": text,
+               "prompt": prompt, "raw": False, "bpm": None, "key": None,
+               "name": name or prompts.file_name(Path(base).stem), "source": base,
+               "duration": round(x.shape[1] / RAW_SR, 2), "gen_length_s": round(x.shape[1] / RAW_SR, 2), "gen_s": 0.0,
+               "post": default_master(opt, None), "warnings": warnings}
+        path = d / "import.wav"
+        audio.write_wav(path, x, RAW_SR, subtype="FLOAT")
+        return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
+
+
+# --------------------------------------------------------------------------- arranging takes
+
+ARRANGE_CONTEXT_S = 20.0  # how much of each part the engine hears either side of a join
+
+
+class PartItem(BaseModel):
+    take: str
+    start: float | None = Field(None, ge=0)  # seconds on the take's raw timeline; default its start
+    end: float | None = Field(None, gt=0)    # default its end
+
+
+class ArrangeReq(ShapeFields):
+    parts: list[PartItem] = Field(min_length=2, max_length=12)
+    bridge: float | None = Field(None, ge=0, le=30)  # new music between parts; default 2 bars (4 s without a tempo)
+    blend: float = Field(1.0, ge=0.25, le=6)         # seconds of each part regenerated beside the bridge
+    text: str | None = Field(None, max_length=1000)  # what the bridges should be; default the first part's prompt
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+
+    @field_validator("text")
+    @classmethod
+    def _not_blank(cls, v: str | None) -> str | None:
+        return _clean_text(v)
+
+
+def _fit(y: np.ndarray, n: int) -> np.ndarray:
+    """y cut or zero-padded to n samples (the engine rounds lengths to whole samples its own way)."""
+    return y[:, :n] if y.shape[1] >= n else np.pad(y, ((0, 0), (0, n - y.shape[1])))
+
+
+def _arrangement_warnings(parts: list[dict]) -> list[str]:
+    """Neighbouring parts at different tempos or in unrelated keys: the bridge has to change them."""
+    out = []
+    for p, q in zip(parts, parts[1:]):
+        tp, tq = (z["take"].get("music", {}).get("tempo", {}) for z in (p, q))
+        if tp.get("bpm") and tq.get("bpm") and min(tp.get("confidence", 0), tq.get("confidence", 0)) \
+                >= checks.TEMPO_CONFIDENT and analysis.tempo_matches(tq["bpm"], tp["bpm"], tol=0.05) is None:
+            out.append(f"{p['ref']} is at {tp['bpm']:.0f} BPM and {q['ref']} at {tq['bpm']:.0f}: the bridge has to "
+                       "change tempo, which may sound abrupt")
+        kp, kq = (z["take"].get("music", {}).get("key", {}) for z in (p, q))
+        if kp.get("key") and kq.get("key") and min(kp.get("strength", 0), kq.get("strength", 0)) >= checks.KEY_CONFIDENT:
+            pp, pm = analysis.parse_key(kp["key"])
+            qp, qm = analysis.parse_key(kq["key"])
+            if analysis.key_relation(qp, qm, pp, pm) is None:
+                out.append(f"{p['ref']} is in {kp['key']} and {q['ref']} in {kq['key']}: the bridge has to modulate")
+    return out
+
+
+@app.post("/api/arrange")
+def arrange(req: ArrangeReq):
+    """Several takes (or spans of them, in seconds as they play), in order, as one new song: at
+    each join the engine hears up to 20 s of the part before and after, and writes `bridge`
+    seconds of new music between them, rewriting `blend` seconds either side so the parts flow
+    into it. Everything else is the parts' own audio. Each take of the result is the whole song,
+    its bridges made with one seed."""
+    saved = local_settings()
+    opt = _resolve(req, saved)
+    parts = []
+    last = len(req.parts) - 1
+    for i, item in enumerate(req.parts):
+        src, take, raw_path = _source(item.take)
+        x, sr = audio.read(raw_path)
+        total = x.shape[1] / sr
+        # At a join the engine must hear music, not a fade-out and silence (given those, it
+        # writes a silent bridge): an inner edge starts or ends with the part's body, unless the
+        # span sets it. The song's very start and end stay as they are.
+        tp = take.get("post", {})
+        looped = tp.get("loop") is not None
+        off = 0.0 if looped else float(tp.get("trim_start_s", 0.0))
+        if item.start is not None or item.end is not None:
+            off = _raw_offset(src, take, item.take)
+        # What the take delivers (a loop: its whole raw), on the raw timeline.
+        lo = 0.0 if looped else off
+        hi = total if looped else (off + tp["cut_at_s"] if tp.get("cut_at_s") else total - tp.get("trim_end_s", 0.0))
+        b0, b1 = analysis.body(x[:, int(lo * sr):int(hi * sr)], sr)
+        a = item.start + off if item.start is not None else (lo + b0 / sr if i > 0 else lo)
+        b = min(item.end + off, total) if item.end is not None else (lo + b1 / sr if i < last else hi)
+        if not 0 <= a < b or b - a < 4.0:
+            raise HTTPException(400, f"part {item.take}: the span must be at least 4 s inside the take "
+                                     f"(0..{hi - lo:.1f} s as it plays)")
+        # Each part at its delivered loudness (its mastering gain; the song is mastered again as a
+        # whole): a quiet recording joined to a generated take would otherwise be 30 dB under it.
+        g = 10 ** (float(tp.get("gain_db", 0.0)) / 20)
+        parts.append({"src": src, "take": take, "ref": item.take, "x": x[:, int(a * sr):int(b * sr)] * g,
+                      "start": round(max(0.0, a - off), 2), "end": round(b - off, 2),
+                      "dropped_s": round((b0 / sr if i > 0 and item.start is None else 0.0)
+                                         + ((hi - lo) - b1 / sr if i < last and item.end is None else 0.0), 1)})
+    first = parts[0]["src"]
+    tempo = parts[0]["take"].get("music", {}).get("tempo", {})
+    bpm = first.get("bpm") or (tempo.get("bpm") if tempo.get("confidence", 0) >= checks.TEMPO_CONFIDENT else None)
+    bridge = req.bridge if req.bridge is not None else (8 * 60.0 / bpm if bpm else 4.0)
+    prompt = (prompts.build_prompt(req.text, first.get("bpm"), first.get("key"), first.get("kind", "music"),
+                                   raw=bool(first.get("raw"))) if req.text else first["prompt"])
+    with _lock:
+        engine = req.engine if "engine" in req.model_fields_set and req.engine else first["engine"]
+        w = _start(engine)
+        seeds = _seeds(req, opt)
+        base = {**first["post"]}
+        base.pop("duration", None)
+        base["loop_bars"] = None
+        po = master_opts(base, req)
+        total_s = sum(p["x"].shape[1] for p in parts) / RAW_SR + bridge * (len(parts) - 1)
+        name = req.name or (prompts.track_name(req.text) if req.text else f"{first['name']}-arranged")
+        rec = _new_record("arrange", opt, w.info, engine, seeds, kind=first.get("kind", "music"),
+                          text=req.text or first.get("text", ""), prompt=prompt, raw=bool(first.get("raw")),
+                          bpm=first.get("bpm"), key=first.get("key"), name=name[:60],
+                          parts=[{"take": p["ref"], "name": p["src"]["name"], "start": p["start"], "end": p["end"]}
+                                 for p in parts],  # the spans as used
+                          bridge=round(bridge, 2), blend=req.blend, duration=round(total_s, 2), post=po.asdict(),
+                          clap_prompt=first["prompt"] or None,
+                          warnings=_arrangement_warnings(parts) + [
+                              f"{p['ref']}: {p['dropped_s']:g} s of fade or quiet edge left out at its join(s) "
+                              "(give a span to keep it)" for p in parts if p["dropped_s"] >= 3])
+        d = req_dir(rec["id"])
+        t0 = time.time()
+        joins = []
+        for j, (p, q) in enumerate(zip(parts, parts[1:])):
+            # Each part's two joins share it: neither may hear more than half of it.
+            ctx_n = int(min(ARRANGE_CONTEXT_S, p["x"].shape[1] / RAW_SR / 2, q["x"].shape[1] / RAW_SR / 2) * RAW_SR)
+            gap = int(bridge * RAW_SR)
+            ctx = np.concatenate([p["x"][:, -ctx_n:], np.zeros((2, gap), np.float32), q["x"][:, :ctx_n]], axis=1)
+            path = d / f"join{j}.wav"
+            audio.write_wav(path, ctx, RAW_SR, subtype="FLOAT")
+            ctx_s = ctx_n / RAW_SR
+            blend = max(0.0, min(req.blend, ctx_s - 2 * post.KEEP_XFADE_S))
+            m0, m1 = ctx_s - blend, ctx_s + bridge + blend
+            job = {"op": "generate", "prompt": prompt, "duration": ctx.shape[1] / RAW_SR, "seeds": seeds,
+                   "steps": rec["steps"], "out_dir": str(d), "stem": f"join{j}", "inpaint_audio": str(path),
+                   "mask_start": m0, "mask_end": m1}
+            reply = _call(rec, job, w)
+            joins.append({"ctx_n": ctx_n, "n": ctx.shape[1], "ctx": ctx, "m0": int(round(m0 * RAW_SR)),
+                          "m1": int(round(m1 * RAW_SR)), "renders": {int(f["seed"]): f["path"] for f in reply["files"]}})
+            path.unlink(missing_ok=True)
+        rec["gen_s"] = round(time.time() - t0, 2)
+        rec["gen_length_s"] = round(sum(jn["n"] for jn in joins) / RAW_SR, 2)
+        xf = int(post.KEEP_XFADE_S * RAW_SR)
+        files = []
+        try:
+            for seed in seeds:
+                # Each join's rendering, with the parts put back outside its bridge and blend
+                # (the engine re-renders the context it heard), starts and ends with the parts'
+                # own samples: the song is the parts and the joins laid end to end.
+                song = [parts[0]["x"][:, :parts[0]["x"].shape[1] - joins[0]["ctx_n"]]]
+                for j, jn in enumerate(joins):
+                    r, _ = audio.read(jn["renders"][seed])
+                    song.append(post.keep_outside(jn["ctx"], _fit(r, jn["n"]), jn["m0"], jn["m1"], xf))
+                    q = parts[j + 1]["x"]
+                    end = q.shape[1] - joins[j + 1]["ctx_n"] if j + 1 < len(joins) else q.shape[1]
+                    song.append(q[:, jn["ctx_n"]:end])
+                path = d / f"gen_{seed}.wav"
+                audio.write_wav(path, np.concatenate(song, axis=1), RAW_SR, subtype="FLOAT")
+                files.append({"seed": seed, "path": str(path)})
+            for jn in joins:
+                for f in jn["renders"].values():
+                    Path(f).unlink(missing_ok=True)
+        except Exception as exc:
+            shutil.rmtree(d, ignore_errors=True)
+            raise HTTPException(500, f"stitching failed: {type(exc).__name__}: {exc}") from exc
+        return _finish(rec, {"files": files}, opt)
+
+
+# --------------------------------------------------------------------------- mixing takes
+
+class MixLayer(BaseModel):
+    take: str
+    gain_db: float = Field(0.0, ge=-60, le=12)  # its volume in the mix
+    at: float = Field(0.0, ge=0, le=1200)       # where it starts in the mix, seconds
+    start: float | None = Field(None, ge=0)     # a span of the take (its delivered timeline)
+    end: float | None = Field(None, gt=0)
+
+
+class MixReq(MasterFields):
+    layers: list[MixLayer] = Field(min_length=2, max_length=8)
+    name: str | None = Field(None, max_length=60, pattern=r"^[A-Za-z0-9-]*$")
+    check: bool | None = None
+
+
+@app.post("/api/mix")
+def mix(req: MixReq):
+    """Takes on top of each other, as one new take: each layer is a take's delivered track (what
+    you hear: mastered, or its loop) at its own volume (gain_db), starting `at` seconds in.
+    Nothing is levelled or ducked automatically. The sum is mastered like any take (so the mix's
+    overall loudness is the usual target; the volumes set the balance), and is a take itself
+    (seed 0), so it can be extended, looped or re-mastered."""
+    opt = effective_settings()
+    if req.check is not None:
+        opt["check"] = req.check
+    layers, srcs, desc = [], [], []
+    for item in req.layers:
+        src, take, _ = _source(item.take)
+        y, sr = audio.read(req_dir(src["id"]) / take["wav"])
+        total = y.shape[1] / sr
+        a = item.start or 0.0
+        b = total if item.end is None else min(item.end, total)
+        if not 0 <= a or b - a < 0.1:
+            raise HTTPException(400, f"layer {item.take}: the span must lie inside the take (0..{total:.1f} s) "
+                                     "and last at least 0.1 s")
+        layers.append(post.Layer(audio=y[:, int(a * sr):int(b * sr)], gain_db=item.gain_db, offset_s=item.at))
+        srcs.append(src)
+        desc.append({"take": item.take, "name": src["name"], "gain_db": item.gain_db, "at": item.at,
+                     "start": round(a, 2), "end": round(b, 2)})
+    base = srcs[0]  # the first layer's prompt, tempo and key carry on (extending the mix uses them)
+    with _lock:
+        y, rep = post.mix_layers(layers, audio.SR)
+        raw = audio.resample(y, audio.SR, RAW_SR)
+        rid = new_id()
+        d = OUTPUT / rid
+        d.mkdir(parents=True)
+        po = master_opts(default_master(opt, base.get("bpm")), req)
+        rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "op": "mix", "engine": base["engine"],
+               "model": "mix", "seeds": [0], "steps": None, "takes": [], "kind": base.get("kind", "music"),
+               "text": base.get("text", ""), "prompt": base["prompt"], "raw": bool(base.get("raw")),
+               "bpm": base.get("bpm"), "key": base.get("key"),
+               "name": (req.name or f"{base['name']}-mix")[:60], "layers": desc, "duration": rep["length_s"], "gen_length_s": rep["length_s"], "gen_s": 0.0, "post": po.asdict(),
+               "warnings": []}
+        path = d / "mix.wav"
+        audio.write_wav(path, raw, RAW_SR, subtype="FLOAT")
+        return _finish(rec, {"files": [{"seed": 0, "path": str(path)}]}, opt)
 
 
 class MasterReq(MasterFields):
@@ -873,7 +1244,14 @@ def delete_request(rid: str):
         raise HTTPException(404, f"no request {rid}")
     with _lock:
         n = sum(1 for p in d.iterdir() if p.is_file())
-        shutil.rmtree(d)
+        for attempt in range(20):  # a file still being streamed to the browser holds the folder
+            try:
+                shutil.rmtree(d)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.1)
     return {"id": rid, "deleted": n}
 
 
@@ -944,7 +1322,7 @@ def save_settings(new: Settings):
     tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
     with _file_lock:  # a reader never sees a half-written file
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp, SETTINGS_FILE)
+        audio.replace(tmp, SETTINGS_FILE)
     return get_settings()
 
 
@@ -967,6 +1345,27 @@ def files(rid: str, name: str):
 @app.get("/", response_class=HTMLResponse)
 def page():
     return (Path(__file__).parent / "page.html").read_text(encoding="utf-8")
+
+
+_ctrl_handler = None  # kept referenced: Windows calls it from its own thread
+
+
+def _clean_up_on_console_close() -> None:
+    """Closing the server's window ends the process without running atexit: delete the PID file
+    and stop the engine worker first, then let Windows end it as usual."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    global _ctrl_handler
+
+    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+    def handler(event: int) -> int:
+        if event in (2, 5, 6):  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+            PID_FILE.unlink(missing_ok=True)
+            _stop_workers()
+        return 0  # not handled: the default handler ends the process
+    _ctrl_handler = handler
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_ctrl_handler, True)
 
 
 _instance_lock = None
@@ -1021,6 +1420,7 @@ def main() -> None:
     OUTPUT.mkdir(exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="ascii")
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+    _clean_up_on_console_close()
     if not args.lazy:
         names = [s.strip() for s in (args.engines or effective_settings()["engine"]).split(",") if s.strip()]
         with _lock:

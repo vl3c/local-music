@@ -68,6 +68,9 @@ def signal_report(x: np.ndarray, sr: int, requested_s: float | None = None) -> d
     level = float(np.percentile(env, 50))
     quiet = env < max(level - 35.0, -70.0)
     loud = np.nonzero(~quiet)[0]
+    if not len(loud):  # a few clicks in silence: nothing that counts as music
+        fails.append(f"silent (no sound above {max(level - 35.0, -70.0):.0f} dBFS beyond a peak of {peak:.0f})")
+        return {**rep, "fails": fails, "warnings": warnings}
     first, last = int(loud[0]), int(loud[-1])
     lead_s, tail_s = first * hop_s, (len(env) - 1 - last) * hop_s
     rep.update(lead_silence_s=round(lead_s, 2), tail_silence_s=round(tail_s, 2))

@@ -123,3 +123,32 @@ def test_manifest_is_consistent():
             assert lock[e["name"]]["revision"] == e["revision"]
             assert all(f["sha256"] and f["bytes"] > 0 for f in lock[e["name"]]["files"])
     assert set(lock) <= set(names)
+
+
+def test_parts_for_combine():
+    ref = "20261010-120000-abcd:5"
+    assert cli.parse_part(ref) == {"take": ref}
+    assert cli.parse_part(f"{ref}@20-60") == {"take": ref, "start": 20.0, "end": 60.0}
+    assert cli.parse_part(f"{ref}@30.5-") == {"take": ref, "start": 30.5}
+    assert cli.parse_part(f"{ref}@-12") == {"take": ref, "end": 12.0}
+    for bad in ("a drum break", f"{ref}@x-y", "20261010-120000-abcd"):
+        with pytest.raises(ValueError):
+            cli.parse_part(bad)
+
+
+def test_audio_files_are_recognised(tmp_path):
+    f = tmp_path / "demo.MP3"
+    f.write_bytes(b"x")
+    assert cli.is_audio_file(str(f)) and not cli.is_audio_file(str(tmp_path / "missing.wav"))
+    assert not cli.is_audio_file("20261010-120000-abcd:5") and not cli.is_audio_file(None)
+
+
+def test_layers_for_mix():
+    ref = "20261010-120000-abcd:5"
+    assert cli.parse_layer(ref) == {"take": ref}
+    assert cli.parse_layer(f"{ref},vol=-8,at=4") == {"take": ref, "gain_db": -8.0, "at": 4.0}
+    assert cli.parse_layer(f"{ref}@10-40, vol=-6dB, at=2.5s") == {"take": ref, "start": 10.0, "end": 40.0,
+                                                                  "gain_db": -6.0, "at": 2.5}
+    for bad in (f"{ref},duck", f"{ref},vol=loud", "voice.mp3,vol=-3"):
+        with pytest.raises(ValueError):
+            cli.parse_layer(bad)

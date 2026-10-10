@@ -28,11 +28,11 @@
     PyTorch wheel index. cu128 is the oldest that supports RTX 50-series (Blackwell) cards.
 
 .PARAMETER ReuseModels
-    The models\ folder of another install (of local-music, or of local-sounds: they share
-    the Stable Audio 3 text encoder and the Audiobox Aesthetics checker). Matching weights are
-    hard-linked (or copied, across drives) instead of downloaded, then checksum-verified. A
-    local-sounds next to this folder is found on its own. Files already in your Hugging Face
-    cache are reused the same way, automatically.
+    The models\ folder of another install (of local-music, or of another tool built on Stable
+    Audio 3: the text encoder, CLAP and Audiobox Aesthetics files are the same). Matching
+    weights are hard-linked (or copied, across drives) instead of downloaded, then
+    checksum-verified. Such a models\ folder in any folder next to this one is found on its
+    own. Files already in your Hugging Face cache are reused the same way, automatically.
 
 .PARAMETER WithSmall
     Also download Stable Audio 3 Small-Music (2.3 GB): a lighter, lower-quality engine.
@@ -224,10 +224,18 @@ if ($SkipModels) {
         if (-not (Test-Path $ReuseModels)) { Fail "-ReuseModels: $ReuseModels does not exist" }
         $reuse += (Resolve-Path $ReuseModels).Path
     }
-    $sibling = Join-Path (Split-Path $RepoRoot -Parent) 'local-sounds\models'
-    if (Test-Path $sibling) {
-        Note "Found local-sounds next to this folder: its matching weights are reused (checksums decide)."
-        $reuse += (Resolve-Path $sibling).Path
+    # Other installs next to this folder whose models\ hold files these weights share (the
+    # Stable Audio 3 text encoder, CLAP, Audiobox Aesthetics): checksums decide what is reused.
+    $parent = Split-Path $RepoRoot -Parent
+    foreach ($dir in @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue)) {
+        if ($dir.FullName.TrimEnd('\') -eq $RepoRoot.TrimEnd('\')) { continue }
+        $m = Join-Path $dir.FullName 'models'
+        if ((Test-Path (Join-Path $m '*\t5gemma-b-b-ul2\model.safetensors')) -or
+            (Test-Path (Join-Path $m 'clap\pytorch_model.bin')) -or
+            (Test-Path (Join-Path $m 'aesthetics\model.safetensors'))) {
+            Note "Found shared weights in $m`: matching files are reused (checksums decide)."
+            $reuse += (Resolve-Path $m).Path
+        }
     }
     foreach ($r in $reuse) { $dlArgs += @('--reuse', $r) }
     & $py @dlArgs
