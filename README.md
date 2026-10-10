@@ -1,6 +1,6 @@
 # local-music
 
-**Powered by Stability AI** (Stable Audio 3).
+**Powered by Stability AI**.
 
 A private, fully local **instrumental music generator**, built for AI agents (and people) to
 call. Describe the music (genre, instruments, mood, tempo, key) and get back mastered
@@ -10,11 +10,11 @@ Continue a track, make variations, redo a section, or cut a seamless loop on the
 from your own audio file; join several takes into one song, with new music written at each
 join; or mix takes on top of each other (a voice over a song), each at its own volume.
 
-It runs **Stable Audio 3 Medium**, the best open-weights model on the
+It runs the best open-weights model on the
 [Artificial Analysis instrumental leaderboard](https://artificialanalysis.ai/music/leaderboard/instrumental)
-that fits a 16 GB card (see [LICENSE-MODELS.md](LICENSE-MODELS.md) for the comparison), on
-your own GPU. Up to 6 min 20 s of stereo music per take, in seconds. No accounts, no cloud:
-prompts and audio never leave the machine.
+that fits a 16 GB card, on your own GPU: currently Stable Audio 3 Medium (see
+[LICENSE-MODELS.md](LICENSE-MODELS.md) for the comparison), up to 6 min 20 s of stereo music per
+take, in seconds. No accounts, no cloud: prompts and audio never leave the machine.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptModelLicenses   # ~17 GB: weights + venv
